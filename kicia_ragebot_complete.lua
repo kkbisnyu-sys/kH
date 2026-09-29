@@ -1523,9 +1523,18 @@ end
 -- ★ v8: 取代 HeadGlueShotPlanner
 --   差異: 不用 PartGlue, 不用畸形座標 (-9e37), 用真實 CFrame + encodeShot 真實表面點
 --   TP: 直接站到 head + 0.5Y (Above) 或 head - 3Y (Below, 倒立)
---   延遲: 到位後等 66ms (1/15 秒) 讓位置封包到 server, 才開火 → 命中率提升
+-- ★ v9: LegitAttackDelay 改可設定 (原檔 hard-code 1/15 = 66.67ms)
+--   意義: 首發射擊前, 等這麼久讓位置封包從客戶端到 server
+--   選值指南 (依網路狀況):
+--     0    → 立刻射 (server 可能還沒收到位置, 判定失敗)
+--     0.017→ 1 幀 @ 60fps, 極穩 LAN
+--     0.033→ 2 幀,  好網路 RTT < 40ms
+--     0.05 → 3 幀,  中等網路
+--     0.067→ 4 幀,  原檔預設, 通用安全值
+--     0.1  → 6 幀,  差網路 RTT > 80ms
 --=========================================================================
-local LEGIT_ATTACK_DELAY   = 1/15   -- 66.67ms, 4 frames @ 60fps
+Config.data.Ragebot.LegitAttackDelay = Config.data.Ragebot.LegitAttackDelay or 1/15
+
 local LEGIT_ABOVE_OFFSET_GUN   = Vector3.new(0, 0.5, 0)
 local LEGIT_BELOW_OFFSET_GUN   = Vector3.new(0, -3, 0)
 local LEGIT_ABOVE_OFFSET_MELEE = Vector3.new(0, 0, 0)     -- 檔 04 §B: root 在頭中心
@@ -1559,13 +1568,16 @@ function LegitShotPlanner:Plan(dt, target, gun, ourRoot, gated)
         return randomFarGun(), nil
     end
 
-    -- ★ 站定延遲: 到位後等 66ms 才開火, 讓伺服器位置同步過來
-    local now = os.clock()
-    if self._attackStart == nil then
-        self._attackStart = now
-    end
-    if now - self._attackStart < LEGIT_ATTACK_DELAY then
-        return stand, nil   -- 站著等, 不開火
+    -- ★ 站定延遲: 到位後等 N ms 才開火, 讓伺服器位置同步過來
+    local delay = Config.data.Ragebot.LegitAttackDelay or 0
+    if delay > 0 then
+        local now = os.clock()
+        if self._attackStart == nil then
+            self._attackStart = now
+        end
+        if now - self._attackStart < delay then
+            return stand, nil   -- 站著等, 不開火
+        end
     end
 
     -- 開火: 起點 = 方向 = lookAt(stand, head), 讓 GunItem 自算真實表面 hitData
@@ -1620,12 +1632,16 @@ function LegitMeleePlanner:Plan(dt, target, melee, ourRoot, gated)
         return randomFarMelee(), nil, nil
     end
 
-    local now = os.clock()
-    if self._attackStart == nil then
-        self._attackStart = now
-    end
-    if now - self._attackStart < LEGIT_ATTACK_DELAY then
-        return stand, nil, nil
+    -- ★ 站定延遲 (可設定)
+    local delay = Config.data.Ragebot.LegitAttackDelay or 0
+    if delay > 0 then
+        local now = os.clock()
+        if self._attackStart == nil then
+            self._attackStart = now
+        end
+        if now - self._attackStart < delay then
+            return stand, nil, nil
+        end
     end
 
     -- Knife: HeavyAttack + viewAngles = 目標 root 朝向
@@ -1977,6 +1993,11 @@ if Library then
     gBox:AddSlider("RB_ShootFrames", {
         Text = "Shoot Frames", Default = 1, Min = 1, Max = 5, Rounding = 0,
         Callback = function(v) Config.data.Ragebot.ShootFrames = v end,
+    })
+    -- ★ v9: Legit 站定延遲 slider (0 = 不等, 66ms = 原檔預設)
+    gBox:AddSlider("RB_LegitAttackDelay", {
+        Text = "Legit Attack Delay (ms)", Default = 67, Min = 0, Max = 200, Rounding = 0,
+        Callback = function(v) Config.data.Ragebot.LegitAttackDelay = v / 1000 end,
     })
     gBox:AddDivider()
     gBox:AddLabel("Weapon Priority")
