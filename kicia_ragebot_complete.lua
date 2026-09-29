@@ -1519,6 +1519,148 @@ function BackstabPlanner:ResetState()
 end
 
 --=========================================================================
+-- §21.5  LegitShotPlanner (R L109300, module "it") — 檔 04 §A, 檔 06 §4
+-- ★ v8: 取代 HeadGlueShotPlanner
+--   差異: 不用 PartGlue, 不用畸形座標 (-9e37), 用真實 CFrame + encodeShot 真實表面點
+--   TP: 直接站到 head + 0.5Y (Above) 或 head - 3Y (Below, 倒立)
+--   延遲: 到位後等 66ms (1/15 秒) 讓位置封包到 server, 才開火 → 命中率提升
+--=========================================================================
+local LEGIT_ATTACK_DELAY   = 1/15   -- 66.67ms, 4 frames @ 60fps
+local LEGIT_ABOVE_OFFSET_GUN   = Vector3.new(0, 0.5, 0)
+local LEGIT_BELOW_OFFSET_GUN   = Vector3.new(0, -3, 0)
+local LEGIT_ABOVE_OFFSET_MELEE = Vector3.new(0, 0, 0)     -- 檔 04 §B: root 在頭中心
+local LEGIT_BELOW_OFFSET_MELEE = Vector3.new(0, -3, 0)
+
+local LegitShotPlanner = {}
+LegitShotPlanner.__index = LegitShotPlanner
+
+function LegitShotPlanner.new()
+    return setmetatable({
+        _shootLock   = FireLock.new(),
+        _attackStart = nil,
+    }, LegitShotPlanner)
+end
+
+function LegitShotPlanner:Plan(dt, target, gun, ourRoot, gated)
+    local head = target.aliveState.hitboxHead
+    local side = getRiotShieldSide(target.fighterState)
+    local isAbove = side ~= "Below"
+
+    -- 站位: 真實世界座標 (檔 04 §A / 檔 06 §4)
+    local stand
+    if isAbove then
+        stand = CFrame.new(head.Position + LEGIT_ABOVE_OFFSET_GUN)   -- 頭上方 0.5
+    else
+        stand = lookAtFrom(head.Position + LEGIT_BELOW_OFFSET_GUN, head.Position)  -- 頭下方 3, 倒立
+    end
+
+    if not self._shootLock:ShouldFire(gated, dt * Config.data.Ragebot.ShootFrames) then
+        self._attackStart = nil
+        return randomFarGun(), nil
+    end
+
+    -- ★ 站定延遲: 到位後等 66ms 才開火, 讓伺服器位置同步過來
+    local now = os.clock()
+    if self._attackStart == nil then
+        self._attackStart = now
+    end
+    if now - self._attackStart < LEGIT_ATTACK_DELAY then
+        return stand, nil   -- 站著等, 不開火
+    end
+
+    -- 開火: 起點 = 方向 = lookAt(stand, head), 讓 GunItem 自算真實表面 hitData
+    return stand, function()
+        local origin = CFrame.lookAt(stand.Position, head.Position)
+        local dir    = CFrame.lookAt(stand.Position, head.Position)
+        if type(gun.ShootAt) == "function" then
+            pcall(gun.ShootAt, gun, origin, dir, { part = head })
+        else
+            -- fallback: 真實座標但用常數 hitData (少數 executor 拿不到 ShootAt)
+            gunShootEncoded(gun, CFrameCodec.encode(origin), CFrameCodec.encode(dir), head, HIT_DATA)
+        end
+    end
+end
+
+function LegitShotPlanner:ResetState()
+    self._shootLock:Reset()
+    self._attackStart = nil
+end
+
+--=========================================================================
+-- §21.6  LegitMeleePlanner (R L109401, module "iu") — 檔 04 §B
+-- ★ v8: 取代 BackstabPlanner
+--   差異: 無 PartGlue, 無 0.625s 背刺視窗, 無 1.25s 冷卻
+--         每 tick 檢查 ShootLock + 66ms 站定延遲後直接送 Attack/HeavyAttack
+--=========================================================================
+local LegitMeleePlanner = {}
+LegitMeleePlanner.__index = LegitMeleePlanner
+
+function LegitMeleePlanner.new()
+    return setmetatable({
+        _shootLock   = FireLock.new(),
+        _attackStart = nil,
+    }, LegitMeleePlanner)
+end
+
+function LegitMeleePlanner:Plan(dt, target, melee, ourRoot, gated)
+    local head = target.aliveState.hitboxHead
+    local root = target.aliveState.rootPart
+    local side = getRiotShieldSide(target.fighterState)
+    local isAbove = side ~= "Below"
+
+    local stand
+    if isAbove then
+        stand = CFrame.new(head.Position + LEGIT_ABOVE_OFFSET_MELEE)   -- root 在頭中心
+    else
+        stand = lookAtFrom(head.Position + LEGIT_BELOW_OFFSET_MELEE, head.Position)
+    end
+
+    if not self._shootLock:ShouldFire(gated, dt * Config.data.Ragebot.ShootFrames) then
+        self._attackStart = nil
+        return randomFarMelee(), nil, nil
+    end
+
+    local now = os.clock()
+    if self._attackStart == nil then
+        self._attackStart = now
+    end
+    if now - self._attackStart < LEGIT_ATTACK_DELAY then
+        return stand, nil, nil
+    end
+
+    -- Knife: HeavyAttack + viewAngles = 目標 root 朝向
+    if melee.Info and melee.Info.Name == "Knife" then
+        local pitch, yaw = root.CFrame:ToOrientation()
+        local viewAngles = { kind = "Normalized", pitch = math.deg(pitch), yaw = math.deg(yaw) }
+        return stand, viewAngles, function()
+            local origin = CFrame.lookAt(stand.Position, head.Position)
+            local dir    = CFrame.lookAt(stand.Position, head.Position)
+            if type(melee.HeavyAttack) == "function" then
+                pcall(melee.HeavyAttack, melee, origin, dir, { part = head })
+            else
+                meleeHeavyAttackEncoded(melee, CFrameCodec.encode(origin), CFrameCodec.encode(dir), head, HIT_DATA)
+            end
+        end
+    end
+
+    -- 非刀近戰: Attack, 不送 viewAngles
+    return stand, nil, function()
+        local origin = CFrame.lookAt(stand.Position, head.Position)
+        local dir    = CFrame.lookAt(stand.Position, head.Position)
+        if type(melee.Attack) == "function" then
+            pcall(melee.Attack, melee, origin, dir, { part = head })
+        else
+            meleeAttackEncoded(melee, CFrameCodec.encode(origin), CFrameCodec.encode(dir), head, HIT_DATA)
+        end
+    end
+end
+
+function LegitMeleePlanner:ResetState()
+    self._shootLock:Reset()
+    self._attackStart = nil
+end
+
+--=========================================================================
 -- §22  Ragebot 主類 (K L62943, R L108494)
 --=========================================================================
 local Ragebot = {}
@@ -1527,23 +1669,28 @@ Ragebot.__index = Ragebot
 local VIEW_ANGLES_SLOT = 20
 
 function Ragebot.new()
+    -- ★ v8: 用 LegitRagebot 策略取代 HeadGlue + Backstab
+    -- 差異對照:
+    --   HeadGlue (主版)          → LegitShotPlanner  (檔 04 §A, R L109300)
+    --   BackstabPlanner (主版)   → LegitMeleePlanner (檔 04 §B, R L109401)
+    -- LegitRagebot 不用 PartGlue, 所以 partGlue 只留給以後想切回主版用 (目前 unused)
     local partGlue = PartGlue.new()
     return setmetatable({
         _enabled                 = false,
-        _partGlue                = partGlue,
+        _partGlue                = partGlue,               -- 保留但不用 (Legit 不需要)
         _stateHook               = StateHook.new(),
-        _cameraSwayDisabler      = CameraSwayDisabler.new(),  -- ★ v6
+        _cameraSwayDisabler      = CameraSwayDisabler.new(),
         _spatialLimitGate        = SpatialLimitGate.new(FighterRegistry),
         _targetSelection         = TargetSelection.new(FighterRegistry, PlayerTagsStub),
         _projectileBreakerTeleport= PBT.new(FighterRegistry),
-        _hitscanStrategy         = HeadGlueShotPlanner.new(partGlue),
-        _meleeStrategy           = BackstabPlanner.new(partGlue),
+        _hitscanStrategy         = LegitShotPlanner.new(),   -- ★ v8: 換掉 HeadGlue
+        _meleeStrategy           = LegitMeleePlanner.new(),  -- ★ v8: 換掉 Backstab
         _characterController     = nil,
         _fireCount               = 0,
         _crouchForced            = false,
         _lastTargetWorld         = nil,
         _lastDefensiveViewAngles = nil,
-        _diagnostic              = false,  -- ★ v6: 設 true 印每次射擊
+        _diagnostic              = false,
     }, Ragebot)
 end
 
