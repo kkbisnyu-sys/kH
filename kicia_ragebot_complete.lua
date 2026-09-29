@@ -82,6 +82,34 @@ local rawFireServerUnreliable = dummyUnreliable.FireServer
 dummyRemote:Destroy()
 dummyUnreliable:Destroy()
 
+-- ★ v7 新增 (檔 11 §3): 驗證 FireServer 沒被 hook 過, 如失敗就 warn (不卡死, 讓 Ragebot 還能跑)
+local function verifyFireServer(fs, label)
+    local reasons = {}
+    if type(fs) ~= "function" then table.insert(reasons, "not function") end
+    if debug and debug.info then
+        local ok, src = pcall(debug.info, fs, "s")
+        if ok and src ~= "[C]" then table.insert(reasons, "src=" .. tostring(src) .. " (should be [C])") end
+    end
+    if _G.islclosure and _G.islclosure(fs) then table.insert(reasons, "islclosure=true (被 hookfunction 換成 Lua)") end
+    if _G.isfunctionhooked and _G.isfunctionhooked(fs) then table.insert(reasons, "isfunctionhooked=true") end
+    if _G.isnewcclosure and _G.isnewcclosure(fs) then table.insert(reasons, "isnewcclosure=true (被 newcclosure 包過)") end
+    -- Identity 檢查
+    local fresh, freshFs
+    if label == "FireServer" then
+        fresh = Instance.new("RemoteEvent"); freshFs = fresh.FireServer; fresh:Destroy()
+    else
+        fresh = Instance.new("UnreliableRemoteEvent"); freshFs = fresh.FireServer; fresh:Destroy()
+    end
+    if fs ~= freshFs then table.insert(reasons, "identity mismatch (別的外掛動了 FireServer)") end
+    if #reasons > 0 then
+        warn("[kicia] " .. label .. " 驗證失敗: " .. table.concat(reasons, "; "))
+        return false
+    end
+    return true
+end
+verifyFireServer(rawFireServer, "FireServer")
+verifyFireServer(rawFireServerUnreliable, "FireServerUnreliable")
+
 --=========================================================================
 -- §1  EnumLibrary (遊戲內建 enum → byte 編碼)
 --=========================================================================
@@ -1707,9 +1735,9 @@ function Ragebot:Destroy()
     if self._characterController then self._characterController:Destroy() end
 end
 
--- ★ v6 新增: 更簡單、更直白的 Silent-Aim Ragebot (從 R L108862 module "ir" 抽出來)
--- 特點: TP 直接到 target root position, 從 head 上下 50 studs 開槍
--- 用途: 命中判定簡單 (你就站在目標身上, 從空中垂直射穿頭), 可作為 fallback 模式
+-- ★ v6→v7: 更簡單、更直白的 Silent-Aim Ragebot (R L108862 module "ir" 逐字還原)
+-- Doc 05 §2 三版比較表: 簡易版用「真實表面點」計算 hitData, 不是主版的常數
+-- ★ v7 修正: 用 gun:ShootAt 讓 GunItem 自算 hitData, 不再硬塞主版的常數 HIT_DATA
 Ragebot.SilentAimUpdate = function(self)
     if not self._enabled then self:_Reset(); return end
     local myF = FighterController.LocalFighter
@@ -1718,31 +1746,28 @@ Ragebot.SilentAimUpdate = function(self)
     if target == nil then self:_Reset(); return end
     local cc = self:_EnsureCharacterController()
     if not cc then return end
-    -- TP 我方到 target rootPart 位置
+    -- 簡易版原檔: SetServerCFrame(CFrame.new(target.rootPart.Position))
     cc:SetServerCFrame(CFrame.new(target.aliveState.rootPart.Position))
-    -- 找到手上的槍
+    -- 找手上有裝備且有彈的槍
     local gun = nil
-    if myF.Items then
-        for _, item in pairs(myF.Items) do
-            if item.Info and item.Info.Type == "Gun" and item.IsEquipped
-               and (item.Data.Ammo or 0) > 0 then
-                gun = item; break
-            end
+    if myF.EquippedItem and myF.EquippedItem.Info and myF.EquippedItem.Info.Type == "Gun" then
+        if (myF.EquippedItem.Data.Ammo or 0) > 0 then
+            gun = myF.EquippedItem   -- 對應原檔 EquippedItemAsGun()
         end
     end
-    if gun == nil then
-        cc:HeartbeatUpdate()
-        return
-    end
+    if gun == nil then return end   -- 原檔: EquippedItemAsGun 回 nil 直接 return (不動 CFrame)
     -- 從 head +50 → head -50, 垂直穿過 hitbox
-    local headPos = target.aliveState.hitboxHead.Position
-    local origin = CFrame.new(headPos + Vector3.new(0, 50, 0))
-    local dir    = CFrame.new(headPos - Vector3.new(0, 50, 0))
-    cc:HeartbeatUpdate()   -- ★ 位置先 apply
-    cc:FlushViewAngles()
-    -- 送 shoot 封包
-    gunShootEncoded(gun, CFrameCodec.encode(origin), CFrameCodec.encode(dir),
-                    target.aliveState.hitboxHead, HIT_DATA)
+    local head = target.aliveState.hitboxHead
+    local origin = CFrame.new(head.Position + Vector3.new(0, 50, 0))
+    local dir    = CFrame.new(head.Position - Vector3.new(0, 50, 0))
+    -- ★ v7 關鍵修正: 用 gun:ShootAt 讓 GunItem 內部走 encodeShot 算真實 hitData
+    -- 原檔 R L108888: ShootAt6(EquippedItemAsGun15, v12421, v12422, t4792)
+    if type(gun.ShootAt) == "function" then
+        pcall(gun.ShootAt, gun, origin, dir, { part = head })
+    else
+        -- fallback: 手工做 encodeShot 之後 ShootEncoded (少數 executor 拿不到 GunItem 方法時)
+        gunShootEncoded(gun, CFrameCodec.encode(origin), CFrameCodec.encode(dir), head, HIT_DATA)
+    end
     self._fireCount = self._fireCount + 1
 end
 
