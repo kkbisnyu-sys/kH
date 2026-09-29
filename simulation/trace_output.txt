@@ -1,0 +1,88 @@
+═══════════════════════════════════════════════════════════
+  RAGEBOT 时序仿真 - 3 帧 (每帧 16.67ms)
+═══════════════════════════════════════════════════════════
+
+>>>>>>>>>>> FRAME 1 @ 0.0000s <<<<<<<<<<<
+[0.0000s][UPDATE] === Ragebot:Update(dt=0.016666666666667) 开始 ===
+[0.0000s][UPDATE] target = TargetSelection:GetTarget()  → EnemyHead
+[0.0000s][UPDATE] plan.cframe = CFrame.new(Vec3(100,50.5,200))
+[0.0000s][UPDATE] plan.weaponAction = shoot()
+[0.0000s][UPDATE] → _ApplyPlan()
+[0.0000s][DESYNC] SetServerCFrame stored → CFrame.new(Vec3(100,50.5,200))  (part.CFrame NOT yet moved!)
+[0.0000s][UPDATE] → SendViewAngles(remote, angles)
+[0.0000s][UPDATE] → _ApplyForcedCrouch(true)
+[0.0000s][UPDATE] → weaponAction()  ★ 射击封包立即发送 ★
+[0.0000s][NET] >>> FireServer(UseItemRemote.StartShooting) origin=CFrame.lookAt(CFrame.new(Vec3(100,50.5,200)),Vec3(100,50,200)), part=EnemyHead, isRaycast=true
+[0.0000s][UPDATE] === Ragebot:Update 结束 ===
+
+[0.0000s][TICK] -- Roblox Heartbeat 事件触发 --
+[0.0000s][HEARTBEAT] rootPart.CFrame ← CFrame.new(Vec3(100,50.5,200))  (server physics will replicate THIS position)
+[0.0000s][PHYS] [假位置] rootPart 被物理线程复制到服务器 (FFlag=120Hz)
+[0.0167s][TICK] -- 下一帧 RenderStepped 前 --
+[0.0167s][RENDER] rootPart.CFrame ← Vec3(0,5,0) (restore client view)
+
+>>>>>>>>>>> FRAME 2 @ 0.0167s <<<<<<<<<<<
+[0.0167s][UPDATE] === Ragebot:Update(dt=0.016666666666667) 开始 ===
+[0.0167s][UPDATE] target = TargetSelection:GetTarget()  → EnemyHead
+[0.0167s][UPDATE] plan.cframe = CFrame.new(Vec3(100,50.5,200))
+[0.0167s][UPDATE] plan.weaponAction = shoot()
+[0.0167s][UPDATE] → _ApplyPlan()
+[0.0167s][DESYNC] SetServerCFrame stored → CFrame.new(Vec3(100,50.5,200))  (part.CFrame NOT yet moved!)
+[0.0167s][UPDATE] → SendViewAngles(remote, angles)
+[0.0167s][UPDATE] → _ApplyForcedCrouch(true)
+[0.0167s][UPDATE] → weaponAction()  ★ 射击封包立即发送 ★
+[0.0167s][NET] >>> FireServer(UseItemRemote.StartShooting) origin=CFrame.lookAt(CFrame.new(Vec3(100,50.5,200)),Vec3(100,50,200)), part=EnemyHead, isRaycast=true
+[0.0167s][UPDATE] === Ragebot:Update 结束 ===
+
+[0.0167s][TICK] -- Roblox Heartbeat 事件触发 --
+[0.0167s][HEARTBEAT] rootPart.CFrame ← CFrame.new(Vec3(100,50.5,200))  (server physics will replicate THIS position)
+[0.0167s][PHYS] [假位置] rootPart 被物理线程复制到服务器 (FFlag=120Hz)
+[0.0333s][TICK] -- 下一帧 RenderStepped 前 --
+[0.0333s][RENDER] rootPart.CFrame ← Vec3(0,5,0) (restore client view)
+
+>>>>>>>>>>> FRAME 3 @ 0.0333s <<<<<<<<<<<
+[0.0333s][UPDATE] === Ragebot:Update(dt=0.016666666666667) 开始 ===
+[0.0333s][UPDATE] target = TargetSelection:GetTarget()  → EnemyHead
+[0.0333s][UPDATE] plan.cframe = CFrame.new(Vec3(100,50.5,200))
+[0.0333s][UPDATE] plan.weaponAction = shoot()
+[0.0333s][UPDATE] → _ApplyPlan()
+[0.0333s][DESYNC] SetServerCFrame stored → CFrame.new(Vec3(100,50.5,200))  (part.CFrame NOT yet moved!)
+[0.0333s][UPDATE] → SendViewAngles(remote, angles)
+[0.0333s][UPDATE] → _ApplyForcedCrouch(true)
+[0.0333s][UPDATE] → weaponAction()  ★ 射击封包立即发送 ★
+[0.0333s][NET] >>> FireServer(UseItemRemote.StartShooting) origin=CFrame.lookAt(CFrame.new(Vec3(100,50.5,200)),Vec3(100,50,200)), part=EnemyHead, isRaycast=true
+[0.0333s][UPDATE] === Ragebot:Update 结束 ===
+
+[0.0333s][TICK] -- Roblox Heartbeat 事件触发 --
+[0.0333s][HEARTBEAT] rootPart.CFrame ← CFrame.new(Vec3(100,50.5,200))  (server physics will replicate THIS position)
+[0.0333s][PHYS] [假位置] rootPart 被物理线程复制到服务器 (FFlag=120Hz)
+[0.0500s][TICK] -- 下一帧 RenderStepped 前 --
+[0.0500s][RENDER] rootPart.CFrame ← Vec3(0,5,0) (restore client view)
+
+═══════════════════════════════════════════════════════════
+  封包传输时序汇总
+═══════════════════════════════════════════════════════════
+  #1 @ 0.0000s → UseItemRemote.StartShooting
+  #2 @ 0.0167s → UseItemRemote.StartShooting
+  #3 @ 0.0333s → UseItemRemote.StartShooting
+
+═══════════════════════════════════════════════════════════
+  验证结论
+═══════════════════════════════════════════════════════════
+✓ SetServerCFrame(cframe) 在 _ApplyPlan 里被立即调用 (存入 _cframe)
+✓ weaponAction() 紧接在 _ApplyForcedCrouch 之后被立即调用
+✓ 射击封包 (UseItemRemote:FireServer) 在同一 Update tick 内发出
+
+但两者通过不同通道到达服务器:
+  ┌ 射击封包: UseItemRemote:FireServer(...)     ← 立即发送
+  └ 假位置 : rootPart.CFrame → Heartbeat 更新 → 物理线程复制
+             (DFIntS2PhysicsSenderRate = 120Hz)
+
+★ 这就是为什么 FFlag 必须把 PhysicsSenderRate 从 15 → 120:
+  确保假位置封包在射击封包之前(或同一tick内)到达服务器,
+  否则服务器会看到你在原位置射击 → 命中检测失败。
+
+★ SetServerCFrame 存进 _cframe 但并未立即修改 rootPart.CFrame,
+  实际改变发生在同一帧的 Heartbeat 事件里 (kicia.lua L144325)。
+  RenderStepped 前又还原回 _oldCFrame → 客户端始终看到自己在原位置。
+
