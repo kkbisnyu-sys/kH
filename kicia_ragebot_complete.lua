@@ -474,6 +474,61 @@ function StateHook:Destroy()
 end
 
 --=========================================================================
+-- §9.5  CameraSwayDisabler (R L82070 — 檔 09 §CameraSwayDisabler)
+--   ★ v6 補: hook GetCameraSway 讓 CameraController:GetPublicState 回傳
+--   "ThirdPerson" — 讓遊戲以為玩家在第三人稱, 停用相機晃動 + 讓 view angle
+--   spoof 更可靠 (第一人稱下相機同步比較嚴)
+--=========================================================================
+local CameraSwayDisabler = {}
+CameraSwayDisabler.__index = CameraSwayDisabler
+
+function CameraSwayDisabler.new() return setmetatable({ _installed = false }, CameraSwayDisabler) end
+
+function CameraSwayDisabler:SetDisabled(disabled)
+    if disabled then self:_Install() else self:_Revert() end
+end
+
+function CameraSwayDisabler:_Install()
+    if self._installed then return end
+    local ok, fc = pcall(require, LocalPlayer.PlayerScripts.Controllers.FighterController)
+    if not ok then return end
+    local mt = getmetatable(fc)
+    local proto = mt and mt.__index
+    local getSway = proto and (proto.GetCameraSway or rawget(proto, "GetCameraSway"))
+    if type(getSway) ~= "function" then return end
+    -- 找 CameraController upvalue
+    local okCam, cameraController = pcall(function()
+        return require(LocalPlayer.PlayerScripts.Controllers.CameraController)
+    end)
+    if not okCam or not cameraController then return end
+    for i = 1, 30 do
+        local ok2, name, val = pcall(debug.getupvalue, getSway, i)
+        if not ok2 or name == nil then break end
+        if type(val) == "table" then
+            for k, v in pairs(val) do
+                if v == cameraController then
+                    local proxy = {}
+                    function proxy.GetPublicState() return "ThirdPerson" end
+                    val[k] = setmetatable(proxy, { __index = v })
+                    self._restore = { container = val, index = k, original = v }
+                    self._installed = true
+                    return
+                end
+            end
+        end
+    end
+end
+
+function CameraSwayDisabler:_Revert()
+    if not self._installed or not self._restore then return end
+    self._restore.container[self._restore.index] = self._restore.original
+    self._installed = false
+    self._restore = nil
+end
+
+function CameraSwayDisabler:Destroy() self:_Revert() end
+
+--=========================================================================
 -- §10  ViewAngleDriver (R L37696 — 檔 09 §3 完整)
 --=========================================================================
 local ViewAngleDriver = {}
@@ -1449,6 +1504,7 @@ function Ragebot.new()
         _enabled                 = false,
         _partGlue                = partGlue,
         _stateHook               = StateHook.new(),
+        _cameraSwayDisabler      = CameraSwayDisabler.new(),  -- ★ v6
         _spatialLimitGate        = SpatialLimitGate.new(FighterRegistry),
         _targetSelection         = TargetSelection.new(FighterRegistry, PlayerTagsStub),
         _projectileBreakerTeleport= PBT.new(FighterRegistry),
@@ -1459,6 +1515,7 @@ function Ragebot.new()
         _crouchForced            = false,
         _lastTargetWorld         = nil,
         _lastDefensiveViewAngles = nil,
+        _diagnostic              = false,  -- ★ v6: 設 true 印每次射擊
     }, Ragebot)
 end
 
@@ -1482,8 +1539,10 @@ function Ragebot:SetEnabled(v)
     if self._enabled == v then return end
     self._enabled = v
     applyFFlags(v)
+    self._cameraSwayDisabler:SetDisabled(v)  -- ★ v6: 啟用時 hook 相機晃動 (讓 view spoof 更穩)
     if not v then self:_Reset() end
-    print(("[kicia_ragebot] %s (fired %d)"):format(v and "ON" or "OFF", self._fireCount))
+    print(("[kicia_ragebot] %s (fired %d, setfflag=%s)"):format(
+        v and "ON" or "OFF", self._fireCount, tostring(type(setfflag))))
 end
 
 function Ragebot:_ApplyForcedCrouch(forced)
@@ -1552,11 +1611,28 @@ function Ragebot:_Plan(dt, action, target, ourRoot, clientCF, evadeMode)
     return {}
 end
 
+-- ★ v6 新增: 算出從我方到 target head 的 view angles
+-- 用途: 當 gun 沒 viewAngles + 沒 defensive angles 時, 至少送個對準 target 的角度,
+-- 這樣 ViewAngleDriver:SendViewAngles 會觸發 hook install → camera replication 被接管
+local function computeAimAtTargetViewAngles(cc, target)
+    if not target then return nil end
+    local myPos = (cc:GetClientCFrame() or CFrame.new()).Position
+    local headPos = target.aliveState.hitboxHead.Position
+    local dir = headPos - myPos
+    if dir.Magnitude < 1e-3 then return nil end
+    dir = dir.Unit
+    -- Roblox camera: pitch = arcsin(-Y), yaw = atan2(-X, -Z)
+    local pitch = math.asin(math.clamp(-dir.Y, -1, 1))
+    local yaw   = math.atan2(-dir.X, -dir.Z)
+    return { kind = "Normalized", pitch = math.deg(pitch), yaw = math.deg(yaw) }
+end
+
 function Ragebot:_ApplyPlan(plan, target, cc)
     local cframe = plan.cframe
+    local viewAngles = plan.viewAngles
     if cframe == nil or target == nil or plan.shouldSkipDefense then
         cc:SetServerCFrame(cframe)
-        cc:SendViewAngles(VIEW_ANGLES_SLOT, plan.viewAngles)
+        cc:SendViewAngles(VIEW_ANGLES_SLOT, viewAngles)
     else
         local myShield = getMyShieldState()
         cc:SetServerCFrame(Defense.getDefensiveCFrame(
@@ -1564,13 +1640,24 @@ function Ragebot:_ApplyPlan(plan, target, cc)
         if plan.isAimPose or plan.shouldDefendInPlace then
             self._lastDefensiveViewAngles = Defense.getDefensiveViewAngles(myShield, target.fighterState)
         end
-        cc:SendViewAngles(VIEW_ANGLES_SLOT, plan.viewAngles or self._lastDefensiveViewAngles)
+        -- ★ v6: 三層 fallback: plan.viewAngles → defensive → 對準 target
+        -- 保證 ViewAngleDriver 有值可送 → replicationHook 會被 install → 相機朝向不會漏
+        viewAngles = viewAngles or self._lastDefensiveViewAngles
+        if viewAngles == nil and plan.isAimPose then
+            viewAngles = computeAimAtTargetViewAngles(cc, target)
+        end
+        cc:SendViewAngles(VIEW_ANGLES_SLOT, viewAngles)
     end
     -- ★ FIX: 立刻 apply, 讓 rootPart.CFrame 在 weaponAction() 之前就已設定
-    -- 這樣物理引擎複製的位置封包在 shoot 封包之前送到 server
-    -- (原本用另一個 Heartbeat callback 做, 但那個在 shoot 之後才跑 → 位置遲到)
     cc:HeartbeatUpdate()
     cc:FlushViewAngles()
+    -- ★ v6 diagnostic
+    if self._diagnostic and target then
+        local serverPos = cc:GetServerCFrame() and cc:GetServerCFrame().Position
+        local headPos = target.aliveState.hitboxHead.Position
+        print(string.format("[kicia] shoot pos=%s → head=%s viewAngles=%s",
+            tostring(serverPos), tostring(headPos), viewAngles and "SET" or "nil"))
+    end
 end
 
 function Ragebot:Update(dt)
@@ -1615,8 +1702,48 @@ end
 function Ragebot:Destroy()
     self:_Reset()
     self._stateHook:Destroy()
+    self._cameraSwayDisabler:Destroy()  -- ★ v6
     self._partGlue:Destroy()
     if self._characterController then self._characterController:Destroy() end
+end
+
+-- ★ v6 新增: 更簡單、更直白的 Silent-Aim Ragebot (從 R L108862 module "ir" 抽出來)
+-- 特點: TP 直接到 target root position, 從 head 上下 50 studs 開槍
+-- 用途: 命中判定簡單 (你就站在目標身上, 從空中垂直射穿頭), 可作為 fallback 模式
+Ragebot.SilentAimUpdate = function(self)
+    if not self._enabled then self:_Reset(); return end
+    local myF = FighterController.LocalFighter
+    if not myF or not myF.Data or not myF.Data.EnvironmentID then self:_Reset(); return end
+    local target = self._targetSelection:GetTarget()
+    if target == nil then self:_Reset(); return end
+    local cc = self:_EnsureCharacterController()
+    if not cc then return end
+    -- TP 我方到 target rootPart 位置
+    cc:SetServerCFrame(CFrame.new(target.aliveState.rootPart.Position))
+    -- 找到手上的槍
+    local gun = nil
+    if myF.Items then
+        for _, item in pairs(myF.Items) do
+            if item.Info and item.Info.Type == "Gun" and item.IsEquipped
+               and (item.Data.Ammo or 0) > 0 then
+                gun = item; break
+            end
+        end
+    end
+    if gun == nil then
+        cc:HeartbeatUpdate()
+        return
+    end
+    -- 從 head +50 → head -50, 垂直穿過 hitbox
+    local headPos = target.aliveState.hitboxHead.Position
+    local origin = CFrame.new(headPos + Vector3.new(0, 50, 0))
+    local dir    = CFrame.new(headPos - Vector3.new(0, 50, 0))
+    cc:HeartbeatUpdate()   -- ★ 位置先 apply
+    cc:FlushViewAngles()
+    -- 送 shoot 封包
+    gunShootEncoded(gun, CFrameCodec.encode(origin), CFrameCodec.encode(dir),
+                    target.aliveState.hitboxHead, HIT_DATA)
+    self._fireCount = self._fireCount + 1
 end
 
 --=========================================================================
