@@ -409,18 +409,20 @@ end
 -- ★ Layer A: SetForced 主動送封包 (KI line 11633)
 -- ★ Layer B: fakeFireServer 攔遊戲自己送的 (KI line 11600-11604) - Luraph 時失敗
 -- ★ Layer C (v4.4 補): IsCrouching 專用 - 額外呼叫 MC:SetCrouching(v) 觸發完整 client state
---   遊戲 method 會自動: WalkSpeed×0.5, SetSprinting(false), _UpdateServerState → 送 packet
---   兩層一起送保證 server 收到 + client state 一致 (避免 anti-cheat 標異常)
+-- ★ Layer D (v5 補): 每 tick 都重送 - 徹底覆蓋遊戲自己送的 (Luraph 下 Layer B 失效時的救命方案)
 function StateHook:SetForced(stateName, value)
     self:_Load()   -- 靜默嘗試 install Layer B
     local encoded = encode(stateName)
-    if self._forced[encoded] == value then return end
+    local changed = self._forced[encoded] ~= value
     self._forced[encoded] = value
     -- Layer A: 直接送 packet
     pcall(rawFireServer, UpdateStateRemote, encoded, value)
-    -- Layer C: IsCrouching 專用, 觸發 client state pipeline
-    if stateName == "IsCrouching" and self._mcRef then
-        pcall(self._mcRef.SetCrouching, self._mcRef, value and true or false)
+    -- Layer C: IsCrouching 專用, 觸發 client state pipeline (只在狀態變化時, 避免重複觸發 walkspeed reset)
+    if changed and stateName == "IsCrouching" and self._mcRef then
+        local setCrouch = self._mcRef.SetCrouching
+        if type(setCrouch) == "function" then
+            pcall(setCrouch, self._mcRef, value and true or false)
+        end
     end
 end
 
@@ -428,12 +430,26 @@ function StateHook:ClearForced(stateName)
     local encoded = encode(stateName)
     if self._forced[encoded] == nil then return end
     self._forced[encoded] = nil
-    local realVal
-    if self._mcRef then realVal = self._mcRef[stateName] end
-    pcall(rawFireServer, UpdateStateRemote, encoded, realVal)
-    -- Layer C: 也還原 client state
+    -- Layer C 先跑, 讓 mc 狀態變成 false
     if stateName == "IsCrouching" and self._mcRef then
-        pcall(self._mcRef.SetCrouching, self._mcRef, false)
+        local setCrouch = self._mcRef.SetCrouching
+        if type(setCrouch) == "function" then
+            pcall(setCrouch, self._mcRef, false)
+        end
+    end
+    -- 然後送真實值 (現在應該是 false 了)
+    local realVal = false
+    if self._mcRef then
+        local v = self._mcRef[stateName]
+        if v ~= nil then realVal = v end
+    end
+    pcall(rawFireServer, UpdateStateRemote, encoded, realVal)
+end
+
+-- ★ Layer D: 每 tick 重送 forced 值, 蓋掉遊戲自己的 _UpdateServerState
+function StateHook:Tick()
+    for encoded, value in pairs(self._forced) do
+        pcall(rawFireServer, UpdateStateRemote, encoded, value)
     end
 end
 
@@ -1541,15 +1557,20 @@ function Ragebot:_ApplyPlan(plan, target, cc)
     if cframe == nil or target == nil or plan.shouldSkipDefense then
         cc:SetServerCFrame(cframe)
         cc:SendViewAngles(VIEW_ANGLES_SLOT, plan.viewAngles)
-        return
+    else
+        local myShield = getMyShieldState()
+        cc:SetServerCFrame(Defense.getDefensiveCFrame(
+            cframe, myShield, target.fighterState, target.aliveState.rootPart))
+        if plan.isAimPose or plan.shouldDefendInPlace then
+            self._lastDefensiveViewAngles = Defense.getDefensiveViewAngles(myShield, target.fighterState)
+        end
+        cc:SendViewAngles(VIEW_ANGLES_SLOT, plan.viewAngles or self._lastDefensiveViewAngles)
     end
-    local myShield = getMyShieldState()
-    cc:SetServerCFrame(Defense.getDefensiveCFrame(
-        cframe, myShield, target.fighterState, target.aliveState.rootPart))
-    if plan.isAimPose or plan.shouldDefendInPlace then
-        self._lastDefensiveViewAngles = Defense.getDefensiveViewAngles(myShield, target.fighterState)
-    end
-    cc:SendViewAngles(VIEW_ANGLES_SLOT, plan.viewAngles or self._lastDefensiveViewAngles)
+    -- ★ FIX: 立刻 apply, 讓 rootPart.CFrame 在 weaponAction() 之前就已設定
+    -- 這樣物理引擎複製的位置封包在 shoot 封包之前送到 server
+    -- (原本用另一個 Heartbeat callback 做, 但那個在 shoot 之後才跑 → 位置遲到)
+    cc:HeartbeatUpdate()
+    cc:FlushViewAngles()
 end
 
 function Ragebot:Update(dt)
@@ -1578,7 +1599,9 @@ function Ragebot:Update(dt)
 
     local plan = self:_Plan(dt, action, target, ourRoot, clientCF, mode)
     self:_ApplyPlan(plan, target, cc)
+    -- ★ FIX v5: 先 crouch, 再 Tick 重送 forced 值 → 讓遊戲下次 _UpdateServerState 送對值
     self:_ApplyForcedCrouch(plan.shouldForceCrouch == true)
+    self._stateHook:Tick()  -- Layer D: 每 tick 重送, 蓋掉遊戲自己送的
 
     if plan.weaponAction then
         -- ★ 只有 fire (不是 Reload/Swap) 才計數
@@ -1602,13 +1625,15 @@ end
 local ragebot = Ragebot.new()
 _G.__kicia_ragebot = ragebot
 
--- 主 Update: PreSimulation (物理算前, 檔 14 §2.3)
+-- ★ v5 FIX: 只保留一個 Heartbeat callback
+-- HeartbeatUpdate + FlushViewAngles 已經在 _ApplyPlan 裡跑了 (在 weaponAction 之前),
+-- 這樣位置封包會先送到 server, 再送 shoot 封包 → 命中判定通過
 local hbConn = RunService.Heartbeat:Connect(function(dt)
     local ok, err = pcall(function() ragebot:Update(dt) end)
     if not ok then warn("[kicia_ragebot] Update err: " .. tostring(err)) end
 end)
 
--- CFrameDesync HeartbeatUpdate + ViewAngle Flush: Heartbeat 尾端
+-- Backup: 每 Heartbeat 保底再 flush 一次 (Update 沒跑或提早 return 時)
 local hbPostConn = RunService.Heartbeat:Connect(function()
     local cc = ragebot._characterController
     if cc then
