@@ -33,7 +33,7 @@ HeadPlanner (K L51894) — 簡易但穩定的命中方式.
 Light 版跟主版差異:
    * 無 PartGlue (不綁頭)
    * 無 Defense (不看敵方盾)
-   * 無 StateHook / 強制蹲 (可選 config 開啟)
+   * 無 StateHook / 強制蹲
    * 無 ProjectileBreaker / Translocate 閃避
    * 用 weapon:ShootAt (真實 encodeShot) 而不是 -9e37 極端座標
    * 站位 = head + 0.5Y (Above) 或 head + -3Y (Below), 不是 farCF
@@ -97,12 +97,10 @@ local TOK_START_RELOADING      = encode("StartReloading")
 local TOK_RELOAD               = encode("Reload")
 local TOK_ATTACK_ANIM_1, _n1   = encodeAny("AttackAnimation1", "Attack1")
 local TOK_HEAVY_ATTACK_ANIM_1, _n2 = encodeAny("HeavyAttackAnimation1", "HeavyAttack1")
-local TOK_IS_CROUCHING         = encode("IsCrouching")
 print(("[kicia_light] melee tokens: attack=%s, heavy=%s"):format(_n1, _n2))
 
 local Remotes = ReplicatedStorage.Remotes.Replication.Fighter
 local UseItemRemote              = Remotes.UseItem
-local UpdateStateRemote          = Remotes.UpdateState
 local UpdateCameraRotationRemote = Remotes.UpdateCameraRotation
 
 --=========================================================================
@@ -128,7 +126,6 @@ local Config = { data = {
         Stability   = 0.15,
         ShootFrames = 1,
         PrioritizeHackers = false,
-        ForceCrouch = false,   -- ★ Light 版預設關, 可選啟用
         Weapons = {
             Priority = { "Primary", "Secondary", "Melee" },
             Enabled  = { Primary = true, Secondary = true, Melee = true },
@@ -715,11 +712,6 @@ LightRagebot.__index = LightRagebot
 
 local VIEW_ANGLES_SLOT = 20
 
--- 可選的強制蹲 (基於主版 StateHook)
-local function sendCrouchState(value)
-    pcall(rawFireServer, UpdateStateRemote, TOK_IS_CROUCHING, value)
-end
-
 function LightRagebot.new()
     return setmetatable({
         _enabled              = false,
@@ -730,7 +722,6 @@ function LightRagebot.new()
         _characterController  = nil,
         _fireCount            = 0,
         _diagnostic           = false,
-        _crouchSentFrame      = -1,
     }, LightRagebot)
 end
 
@@ -760,10 +751,6 @@ function LightRagebot:_Reset()
     if cc then
         cc:SetServerCFrame(nil)
         cc:SendViewAngles(VIEW_ANGLES_SLOT, nil)
-    end
-    -- 清 crouch (如果之前有送)
-    if Config.data.Ragebot.ForceCrouch then
-        sendCrouchState(false)
     end
 end
 
@@ -830,15 +817,6 @@ function LightRagebot:Update(dt)
     local action = ActionPlanner.getAction({ itemBehaviors = myF })
     local plan = self:_Plan(dt, action, target, clientCF, mode)
     self:_ApplyPlan(plan, cc)
-
-    -- ★ 可選: 攻擊時強制蹲下 (Light 版本預設關)
-    if Config.data.Ragebot.ForceCrouch and plan.isAttack then
-        local currentFrame = math.floor(os.clock() * 60)
-        if currentFrame ~= self._crouchSentFrame then
-            sendCrouchState(true)
-            self._crouchSentFrame = currentFrame
-        end
-    end
 
     if plan.weaponAction then
         if not plan._isReloadOrSwap then
@@ -907,11 +885,6 @@ if Library then
     })
     toggle:AddKeyPicker("RB_Bind", { Default = "None", Mode = "Toggle", Text = "Ragebot", NoUI = false })
 
-    gBox:AddToggle("RB_ForceCrouch", {
-        Text = "強制蹲下 (實驗)", Default = false,
-        Tooltip = "攻擊時每 tick 送 IsCrouching=true. Luraph 下可能無效.",
-        Callback = function(v) Config.data.Ragebot.ForceCrouch = v end,
-    })
     gBox:AddToggle("RB_PrioritizeHackers", {
         Text = "Prioritize Hackers", Default = false,
         Callback = function(v) Config.data.Ragebot.PrioritizeHackers = v end,
