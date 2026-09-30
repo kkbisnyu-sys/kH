@@ -153,6 +153,44 @@ end
 function ShootLock:Reset() self._lockedUntil = nil end
 
 --=========================================================================
+-- §4.5  CFrameCodec + encodeHitPart (K L6673, K L142850) — 封包編碼
+-- ★ 關鍵修正: 遊戲原生 item **沒有** ShootAt/Attack/HeavyAttack 方法.
+--   那些是 KI wrapper 加上去的. 舊版 callShootAt 看不到方法就靜默 return false,
+--   結果每 tick 根本沒送封包! 我們必須自己組 payload 直接 rawFireServer.
+--=========================================================================
+local CFrameCodec = {}
+function CFrameCodec.encode(cf)
+    local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
+    return {
+        ["\0"] = x, ["\1"] = y, ["\2"] = z,
+        ["\3"] = math.atan2(-r12, r22),   -- pitch
+        ["\4"] = math.asin(r02),           -- yaw
+        ["\5"] = math.atan2(-r01, r00),    -- roll
+    }
+end
+
+-- K L142850: encodeHitPart(origin, hit) → (raw part, encoded hit CFrame)
+local function encodeHitPart(origin, hit)
+    if hit == nil then return nil, nil end
+    local part = hit.part
+    if not part then return nil, nil end
+    local encoded
+    if hit.objectSpace then
+        encoded = CFrameCodec.encode(CFrame.new(hit.objectSpace))
+    else
+        local ok, closestPos = pcall(function()
+            return part:GetClosestPointOnSurface(origin.Position)
+        end)
+        if ok and closestPos then
+            encoded = CFrameCodec.encode(CFrame.new(closestPos))
+        else
+            encoded = CFrameCodec.encode(CFrame.new(part.Position))
+        end
+    end
+    return part, encoded
+end
+
+--=========================================================================
 -- §5  CFrameDesync (K L144260 + R L37592) — 位置 desync 核心
 --=========================================================================
 local CFrameDesync = {}
@@ -733,44 +771,75 @@ function ActionPlanner.getAction(ctx)
 end
 
 --=========================================================================
--- §13  GunItem / MeleeItem 送封包輔助函式
--- ★ Light 版關鍵: 用 game 原生的 gun:ShootAt (內部 encodeShot 算 hitData),
---   不用常數 HIT_DATA!
+-- §13  Gun / Melee 封包發送 (自己組, 不靠遊戲 wrapper 方法)
+-- ★ 舊版 bug: 遊戲原生 item 沒有 ShootAt/Attack/HeavyAttack 方法.
+--   callShootAt() 看到 gun.ShootAt=nil 就靜默 return false, 根本沒送封包!
+--   → 就是「為什麼沒射集」的原因.
+--   修法: 自己走 encodeHitPart + CFrameCodec + rawFireServer(UseItemRemote, ...)
 --=========================================================================
-local function callShootAt(gun, origin, dir, hitInfo)
-    -- 優先用 game 提供的 ShootAt (它自己算 encodeShot / hitData)
-    if type(gun.ShootAt) == "function" then
-        return pcall(gun.ShootAt, gun, origin, dir, hitInfo)
-    end
-    return false
+
+-- Gun 開火: UseItemRemote:StartShooting
+local function gunShoot(item, originCF, dirCF, hitInfo)
+    local objectId = item.Data and item.Data.ObjectID
+    if not objectId then return false end
+    local hitPart, hitData = encodeHitPart(originCF, hitInfo)
+    if not hitPart or not hitData then return false end
+    local shotArgs = {
+        ["\0"] = CFrameCodec.encode(originCF),
+        ["\1"] = CFrameCodec.encode(dirCF),
+        ["\2"] = hitPart,
+        ["\3"] = hitData,
+    }
+    local isRaycast = item.Info and item.Info.IsRaycast
+    local payload = isRaycast
+        and { ["\1"] = shotArgs, ["\2"] = true }
+        or  { ["\1"] = shotArgs }
+    return pcall(rawFireServer, UseItemRemote, objectId, TOK_START_SHOOTING, payload, nil)
 end
 
-local function callMeleeAttack(item, origin, dir, hitInfo, isHeavy)
-    if isHeavy then
-        if type(item.HeavyAttack) == "function" then
-            return pcall(item.HeavyAttack, item, origin, dir, hitInfo)
-        end
-    else
-        if type(item.Attack) == "function" then
-            return pcall(item.Attack, item, origin, dir, hitInfo)
-        end
-    end
-    return false
+-- Melee 普通攻擊: UseItemRemote:StartShooting + AttackAnimation1
+local function meleeAttack(item, originCF, dirCF, hitInfo)
+    local objectId = item.Data and item.Data.ObjectID
+    if not objectId then return false end
+    local hitPart, hitData = encodeHitPart(originCF, hitInfo)
+    if not hitPart or not hitData then return false end
+    local attackArgs = {
+        ["\0"] = CFrameCodec.encode(originCF),
+        ["\1"] = CFrameCodec.encode(dirCF),
+        ["\2"] = hitPart,
+        ["\3"] = hitData,
+    }
+    local payload = { ["\1"] = attackArgs, ["\2"] = TOK_ATTACK_ANIM_1 }
+    return pcall(rawFireServer, UseItemRemote, objectId, TOK_START_SHOOTING, payload, nil)
 end
 
-local function callReload(item)
-    if type(item.Reload) == "function" then
-        return pcall(item.Reload, item)
-    end
-    -- Fallback: 手工送 remote
-    pcall(rawFireServer, UseItemRemote, item.Data.ObjectID, TOK_START_RELOADING,
-          { ["\1"] = TOK_RELOAD, ["\2"] = TOK_RELOAD }, nil)
+-- Melee 重擊 (Knife 背刺): UseItemRemote:StartAiming + HeavyAttackAnimation1
+local function meleeHeavyAttack(item, originCF, dirCF, hitInfo)
+    local objectId = item.Data and item.Data.ObjectID
+    if not objectId then return false end
+    local hitPart, hitData = encodeHitPart(originCF, hitInfo)
+    if not hitPart or not hitData then return false end
+    local attackArgs = {
+        ["\0"] = CFrameCodec.encode(originCF),
+        ["\1"] = CFrameCodec.encode(dirCF),
+        ["\2"] = hitPart,
+        ["\3"] = hitData,
+    }
+    local payload = { ["\1"] = attackArgs, ["\2"] = TOK_HEAVY_ATTACK_ANIM_1 }
+    return pcall(rawFireServer, UseItemRemote, objectId, TOK_START_AIMING, payload, nil)
 end
 
-local function callEquip(item)
-    if type(item.Equip) == "function" then
-        return pcall(item.Equip, item)
-    end
+-- Reload: UseItemRemote:StartReloading
+local function itemReload(item)
+    local objectId = item.Data and item.Data.ObjectID
+    if not objectId then return false end
+    return pcall(rawFireServer, UseItemRemote, objectId, TOK_START_RELOADING,
+                 { ["\1"] = TOK_RELOAD, ["\2"] = TOK_RELOAD }, nil)
+end
+
+-- Equip: 呼叫遊戲的 ClientFighter:EquipItem (identity 2)
+local function itemEquip(item)
+    if item.IsEquipped then return end
     local cf = item.ClientFighter or FighterController.LocalFighter
     local idx = (item.Data and item.Data.ItemIndex) or item.index
     if not cf or not idx or type(cf.EquipItem) ~= "function" then return end
@@ -838,7 +907,7 @@ function HeadShotPlanner:Plan(dt, target, gun, gated)
     local shoot = function()
         local origin = standCFrame.Position
         local aim = CFrame.lookAt(origin, headPosition)
-        callShootAt(gun, aim, aim, { part = hitboxHead })
+        gunShoot(gun, aim, aim, { part = hitboxHead })
     end
     return standCFrame, shoot
 end
@@ -899,13 +968,13 @@ function HeadPlanner:Plan(dt, target, weapon, gated)
     -- ★ Knife 分支: 用 HeavyAttack (背刺秒殺) + 送目標朝向的 viewAngles
     if weapon.Info and weapon.Info.Name == "Knife" then
         return standCFrame, cameraAngles(rootPart), function()
-            callMeleeAttack(weapon, aim, aim, hitInfo, true)   -- isHeavy = true
+            meleeHeavyAttack(weapon, aim, aim, hitInfo)
         end
     end
 
     -- 其他近戰: 普通 Attack
     return standCFrame, nil, function()
-        callMeleeAttack(weapon, aim, aim, hitInfo, false)
+        meleeAttack(weapon, aim, aim, hitInfo)
     end
 end
 
@@ -977,14 +1046,14 @@ function LightRagebot:_Plan(dt, action, target, clientCF, evadeMode)
     if action.type == "Swap" then
         local item = action.itemEnum.item
         local plan = self:_EvadePlan(clientCF, evadeMode)
-        plan.weaponAction = function() callEquip(item) end
+        plan.weaponAction = function() itemEquip(item) end
         plan._isReloadOrSwap = true
         return plan
     end
     if action.type == "Reload" then
         local item = action.itemEnum.item
         local plan = self:_EvadePlan(clientCF, evadeMode)
-        plan.weaponAction = function() callReload(item) end
+        plan.weaponAction = function() itemReload(item) end
         plan._isReloadOrSwap = true
         return plan
     end
@@ -993,9 +1062,12 @@ function LightRagebot:_Plan(dt, action, target, clientCF, evadeMode)
     if ie.type == "Gun" then
         local gun = ie.item
         -- 檢查是否正在 reload
-        if type(gun.IsReloading) == "function" then
-            local ok, r = pcall(gun.IsReloading, gun)
-            if ok and r then return self:_EvadePlan(clientCF, evadeMode) end
+        -- 遊戲原生 item 用 _reload_cooldown / _shoot_cooldown_no_ammo 判斷 reload
+        local now = tick()
+        local rc = gun._reload_cooldown
+        local sc = gun._shoot_cooldown_no_ammo
+        if (type(rc) == "number" and now < rc) or (type(sc) == "number" and now < sc) then
+            return self:_EvadePlan(clientCF, evadeMode)
         end
         local cf, act = self._hitscanStrategy:Plan(dt, target, gun, gated)
         -- ★ Gun 需要 Defense (isAimPose 為 true 才會算 defensive viewAngles)
