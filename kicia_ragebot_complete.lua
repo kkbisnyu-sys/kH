@@ -125,6 +125,7 @@ local Config = { data = {
         Keybind = { State = false, Kind = "Always", Bind = nil, ShowInList = true, Invisible = false },
         Stability   = 0.15,
         ShootFrames = 1,
+        LeadTime    = 0.05,   -- ★ v5: 移動目標預測補償 (秒). 0=關閉, 0.05=補50ms 網路延遲
         PrioritizeHackers = false,
         Weapons = {
             Priority = { "Primary", "Secondary", "Melee" },
@@ -881,14 +882,14 @@ local function itemEquip(item)
 end
 
 --=========================================================================
--- §14  HeadShotPlanner (K L13683) — Gun 策略
+-- §14  HeadShotPlanner (K L13683) — Gun 策略 + v5 移動預測
 --=========================================================================
 local HeadShotPlanner = {}
 HeadShotPlanner.__index = HeadShotPlanner
 
-local HSP_ABOVE_OFFSET = Vector3.new(0, 0.5, 0)   -- 頭上 0.5 studs
-local HSP_BELOW_OFFSET = Vector3.new(0, -3, 0)    -- 頭下 3 studs
-local HSP_ATTACK_DELAY = 0.06666666666666667      -- 4 frames @60Hz
+local HSP_ABOVE_OFFSET = Vector3.new(0, 0.5, 0)
+local HSP_BELOW_OFFSET = Vector3.new(0, -3, 0)
+local HSP_ATTACK_DELAY = 0.06666666666666667
 
 local function lookAtFrom(origin, focus)
     local dir = focus - origin
@@ -904,8 +905,28 @@ local function randomFarCFrame()
         math.random(-1000000, 1000000))
 end
 
--- Light 版不看敵方盾, 一律當 Above
 local function getVerticalSideStub() return "Above" end
+
+-- ★ v5: 預測 target 未來位置
+-- 讀 rootPart / hitboxHead 的 AssemblyLinearVelocity, 加上 leadTime 補償網路延遲
+local function predictHeadPosition(target, leadTime)
+    local head = target.aliveState.hitboxHead
+    local root = target.aliveState.rootPart
+    -- 優先讀 AssemblyLinearVelocity (整個 assembly 的速度, 較穩), fallback Velocity
+    local vel = nil
+    local function safeVel(p)
+        if not p then return nil end
+        local ok, v = pcall(function() return p.AssemblyLinearVelocity end)
+        if ok and v then return v end
+        ok, v = pcall(function() return p.Velocity end)
+        if ok and v then return v end
+        return nil
+    end
+    vel = safeVel(root) or safeVel(head) or Vector3.new()
+    -- 限制預測距離避免過度 (跑步 ~16 studs/s, jump ~50 studs/s)
+    if vel.Magnitude > 100 then vel = vel.Unit * 100 end
+    return head.Position + vel * leadTime
+end
 
 function HeadShotPlanner.new()
     return setmetatable({ _shootLock = ShootLock.new(), _attackStart = nil }, HeadShotPlanner)
@@ -913,9 +934,13 @@ end
 
 function HeadShotPlanner:Plan(dt, target, gun, gated)
     local hitboxHead = target.aliveState.hitboxHead
-    local headPosition = hitboxHead.Position
     local isAbove = getVerticalSideStub() ~= "Below"
     local offset = isAbove and HSP_ABOVE_OFFSET or HSP_BELOW_OFFSET
+
+    -- ★ v5: 預測 head 位置 (補償 ~50ms 網路延遲, 讓 server 收到封包時
+    --   我們的假位置剛好對到 target 的當下位置)
+    local leadTime = Config.data.Ragebot.LeadTime or 0.05
+    local headPosition = predictHeadPosition(target, leadTime)
 
     local standCFrame
     if isAbove then
@@ -933,10 +958,9 @@ function HeadShotPlanner:Plan(dt, target, gun, gated)
     local attackStart = self._attackStart or now2
     self._attackStart = attackStart
     if now2 - attackStart < HSP_ATTACK_DELAY then
-        return standCFrame, nil   -- 站到位, 等 delay
+        return standCFrame, nil
     end
 
-    -- ★ v4: 用極端座標常量, 不再算 aim
     local shoot = function()
         gunShoot(gun, isAbove, hitboxHead)
     end
@@ -969,7 +993,9 @@ end
 function HeadPlanner:Plan(dt, target, weapon, gated)
     local rootPart = target.aliveState.rootPart
     local hitboxHead = target.aliveState.hitboxHead
-    local headPosition = hitboxHead.Position
+    -- ★ v5: 近戰也預測 (Knife 背刺跑動目標)
+    local leadTime = Config.data.Ragebot.LeadTime or 0.05
+    local headPosition = predictHeadPosition(target, leadTime)
     local isAbove = getVerticalSideStub() ~= "Below"
     local offset = isAbove and HP_ABOVE_OFFSET or HP_BELOW_OFFSET
 
@@ -1228,6 +1254,11 @@ if Library then
         Text = "Shoot Frames", Default = 1, Min = 1, Max = 5, Rounding = 0,
         Callback = function(v) Config.data.Ragebot.ShootFrames = v end,
     })
+    gBox:AddSlider("RB_LeadTime", {
+        Text = "Lead Time (跑動預測)", Default = 0.05, Min = 0, Max = 0.3, Rounding = 3,
+        Tooltip = "預測目標未來位置補償網路延遲. 0=關閉, 0.05=50ms (推薦), 高延遲用更大值.",
+        Callback = function(v) Config.data.Ragebot.LeadTime = v end,
+    })
     gBox:AddDivider()
     gBox:AddLabel("Weapon Priority")
     for _, s in ipairs({ "Primary", "Secondary", "Melee" }) do
@@ -1240,11 +1271,6 @@ if Library then
         Values = { "Swap", "Reload", "SwapOrReload" },
         Default = "SwapOrReload", Multi = false, Text = "On Empty",
         Callback = function(v) Config.data.Ragebot.Weapons.OnEmpty = v end,
-    })
-    gBox:AddToggle("RB_MeleeOnly", {
-        Text = "只用近戰 (Knife 測試)", Default = false,
-        Tooltip = "強制只用 Melee 槽位, 忽略 Primary/Secondary. 開啟後手上會自動切到 Knife/近戰.",
-        Callback = function(v) Config.data.Ragebot.Weapons.MeleeOnly = v end,
     })
 
     sBox:AddDropdown("RB_EvasionMode", {
