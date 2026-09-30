@@ -210,6 +210,9 @@ end
 function RotationCodec.encodeCameraRotation(v)
     return RotationCodec.encodeSingle(v.X) .. RotationCodec.encodeSingle(v.Y)
 end
+function RotationCodec.fromXYToCameraRotation(x, y)
+    return Vector2.new(x, y) * (2 * math.pi / 256)
+end
 
 local function encodeAngles(angles)
     if angles.kind == "Normalized" then
@@ -220,17 +223,37 @@ local function encodeAngles(angles)
         .. string.char(math.clamp(math.floor(angles.yaw), 0, 255))
 end
 
+-- 09 §3.3: 轉換為 CameraRotation Vector2, 先量化再回轉 (讓本地和送出去的值一致)
+local function anglesToCameraRotation(angles)
+    if angles.kind == "Normalized" then
+        -- 先 encode 再 decode → 走 1.40625° 的格子 (跟 Flush 送出去的一致)
+        local pByte = string.byte(RotationCodec.encodeSingle(math.rad(angles.pitch)))
+        local yByte = string.byte(RotationCodec.encodeSingle(math.rad(angles.yaw)))
+        return RotationCodec.fromXYToCameraRotation(pByte, yByte)
+    else
+        return RotationCodec.fromXYToCameraRotation(
+            math.clamp(angles.pitch, 0, 255),
+            math.clamp(angles.yaw, 0, 255)
+        )
+    end
+end
+
 --=========================================================================
--- §7  ViewAngleDriver (只有 Knife 會用)
+-- §7  ViewAngleDriver + JointsHook + ReplicationHook (R L37696-37945)
 --=========================================================================
 local ViewAngleDriver = {}
 ViewAngleDriver.__index = ViewAngleDriver
 
 function ViewAngleDriver.new()
     return setmetatable({
-        _slots   = {},
-        _winning = nil,
-        _dirty   = false,
+        _slots                = {},
+        _winning              = nil,
+        _fullySuppressed      = false,
+        _dirty                = false,
+        _jointsInstalled      = false,
+        _replicationInstalled = false,
+        _jointsRestore        = nil,
+        _replicationRestore   = nil,
     }, ViewAngleDriver)
 end
 
@@ -244,15 +267,104 @@ function ViewAngleDriver:_Resolve()
     self._winning = winning
 end
 
+-- ★ Hook A: JointsHook (R L37738) — 本地角色關節照假視角擺
+function ViewAngleDriver:_InstallJointsHook()
+    if self._jointsInstalled then return end
+    local ok, joints = pcall(function()
+        return require(ReplicatedStorage.Modules.ClientFighterCharacterJoints)
+    end)
+    if not ok or type(joints) ~= "table" then
+        warn("[kicia_light] JointsHook: ClientFighterCharacterJoints not found")
+        return
+    end
+    local origUpdate = joints.Update or (getmetatable(joints) and getmetatable(joints).__index and getmetatable(joints).__index.Update)
+    if type(origUpdate) ~= "function" then
+        warn("[kicia_light] JointsHook: Update method not found")
+        return
+    end
+    local driver = self
+    local function jointsUpdateHook(j, dt, state)
+        local w = driver._winning
+        if w ~= nil then
+            local fighter = j and j.ClientFighterCharacter and j.ClientFighterCharacter.ClientFighter
+            if fighter and fighter.IsLocalPlayer then
+                pcall(rawset, state, "CameraRotationRaw", anglesToCameraRotation(w))
+            end
+        end
+        return origUpdate(j, dt, state)
+    end
+    pcall(rawset, joints, "Update", jointsUpdateHook)
+    self._jointsRestore = { target = joints, orig = origUpdate }
+    self._jointsInstalled = true
+    print("[kicia_light] JointsHook 已安裝")
+end
+
+-- ★ Hook B: ReplicationHook (R L37775) — 阻止遊戲送真實視角
+function ViewAngleDriver:_InstallReplicationHook()
+    if self._replicationInstalled then return end
+    local ok, fc = pcall(require, LocalPlayer.PlayerScripts.Controllers.FighterController)
+    if not ok then
+        warn("[kicia_light] ReplicationHook: FighterController not found")
+        return
+    end
+    local mt = getmetatable(fc)
+    local proto = mt and mt.__index
+    local loop = proto and (proto._CameraReplicationLoop or proto.CameraReplicationLoop)
+    if type(loop) ~= "function" then
+        warn("[kicia_light] ReplicationHook: _CameraReplicationLoop not found")
+        return
+    end
+    -- 找 EncodeCameraRotation upvalue (是個帶 metatable.__index 的 table)
+    local upIdx, upOrig
+    for i = 1, 30 do
+        local ok2, name, val = pcall(debug.getupvalue, loop, i)
+        if not ok2 or name == nil then break end
+        if type(val) == "table" then
+            local mtx = getmetatable(val)
+            local idx = mtx and mtx.__index
+            if type(idx) == "table" and idx.EncodeCameraRotation then
+                upIdx, upOrig = i, val
+                break
+            end
+        end
+    end
+    if not upIdx then
+        warn("[kicia_light] ReplicationHook: Utility upvalue not found (可能 Luraph)")
+        return
+    end
+    local driver = self
+    local proxy = {}
+    function proxy.EncodeCameraRotation(_, rot)
+        if next(driver._slots) == nil and not driver._fullySuppressed then
+            return RotationCodec.encodeCameraRotation(rot)   -- 沒 slot → 正常編碼
+        end
+        pcall(rawset, fc, "_replication_stopped", false)     -- 讓 loop 繼續跑
+        return fc._last_encoded_camera_rotation or RotationCodec.encodeCameraRotation(rot)
+    end
+    local okSet = pcall(debug.setupvalue, loop, upIdx, proxy)
+    if not okSet then
+        warn("[kicia_light] ReplicationHook: setupvalue failed")
+        return
+    end
+    self._replicationRestore = { loop = loop, idx = upIdx, orig = upOrig }
+    self._replicationInstalled = true
+    print("[kicia_light] ReplicationHook 已安裝")
+end
+
 function ViewAngleDriver:SendViewAngles(slot, angles)
     if self._slots[slot] == angles then return end
     self._slots[slot] = angles
     self._dirty = true
     self:_Resolve()
+    -- 第一次有 winning 時 lazy install 兩個 hook
+    if self._winning ~= nil then
+        self:_InstallJointsHook()
+        self:_InstallReplicationHook()
+    end
 end
 
 function ViewAngleDriver:Flush()
-    if not self._dirty then return end
+    if not self._dirty or self._fullySuppressed then return end
     if self._winning == nil then self._dirty = false; return end
     self._dirty = false
     pcall(rawFireServerUnreliable, UpdateCameraRotationRemote, encodeAngles(self._winning), nil)
@@ -264,7 +376,27 @@ function ViewAngleDriver:ClearAll()
     self._dirty = true
 end
 
-function ViewAngleDriver:Destroy() self:ClearAll() end
+function ViewAngleDriver:_RevertHooks()
+    if self._jointsRestore then
+        pcall(rawset, self._jointsRestore.target, "Update", self._jointsRestore.orig)
+        self._jointsRestore = nil
+    end
+    if self._replicationRestore then
+        pcall(debug.setupvalue, self._replicationRestore.loop,
+              self._replicationRestore.idx, self._replicationRestore.orig)
+        self._replicationRestore = nil
+    end
+    self._jointsInstalled      = false
+    self._replicationInstalled = false
+end
+
+function ViewAngleDriver:Destroy()
+    self:ClearAll()
+    self:_RevertHooks()
+end
+
+-- ★ 提前 require FighterController, 讓 Defense 能引用
+local FighterController = require(LocalPlayer.PlayerScripts.Controllers.FighterController)
 
 --=========================================================================
 -- §8  CharacterController wrapper
@@ -291,6 +423,86 @@ function CharacterController:FlushViewAngles()    self._viewAngleDriver:Flush() 
 function CharacterController:Destroy()
     self._rootDesync:Destroy()
     self._viewAngleDriver:Destroy()
+end
+
+--=========================================================================
+-- §8.5  Defense (K L150875 + 09 §4) — Riot Shield 防禦計算
+--=========================================================================
+local Defense = {}
+local rngDef = Random.new()
+
+-- getRiotShieldSide (R L107176) — 判斷目標盾牌暴露面
+local function getRiotShieldSide(fighter)
+    if not fighter then return "None" end
+    local ok, rot = pcall(function() return fighter:GetCameraRotation() end)
+    if not ok or not rot then return "None" end
+    local pitch = math.deg(rot.X)
+    local eq = fighter.EquippedItem
+    if eq and eq.Info and eq.Info.Name == "Riot Shield" then
+        if 22 < pitch and pitch < 91 then return "Below" end
+        return "Above"
+    end
+    if type(fighter.Items) == "table" then
+        for _, it in pairs(fighter.Items) do
+            if it.Info and it.Info.Name == "Riot Shield" then
+                if (315 < pitch and pitch < 360) or (0 < pitch and pitch < 91) then
+                    return "Above"
+                end
+                return "Below"
+            end
+        end
+    end
+    return "None"
+end
+
+-- 讀我方 shield 狀態
+local function getMyShieldState()
+    local lf = FighterController.LocalFighter
+    if not lf then return "None" end
+    local eq = lf.EquippedItem
+    if eq and eq.Info then
+        if eq.Info.Name == "Riot Shield" then return "Equipped" end
+    end
+    for _, it in pairs(lf.Items or {}) do
+        if it.Info and it.Info.Name == "Riot Shield" then
+            return "Unequipped"   -- 有盾但沒裝備 (背在背上)
+        end
+    end
+    return "None"
+end
+
+-- 防禦性 CFrame (旋轉)
+function Defense.getDefensiveCFrame(cf, myShield, targetFS, targetRoot)
+    if myShield == "Equipped" then
+        -- 有盾裝備 → 面向目標 (盾在前面擋)
+        return CFrame.new(cf.Position, targetRoot.Position)
+    elseif myShield == "Unequipped" then
+        -- 有盾在背上 → 背對目標 (盾在後面擋)
+        return CFrame.new(cf.Position, cf.Position + (cf.Position - targetRoot.Position))
+    elseif myShield == "None" then
+        -- 沒盾, 目標拿刀 → 隨機轉, 讓對方無法預測背刺角度
+        local tgtEq = targetFS and targetFS.EquippedItem
+        if tgtEq and tgtEq.Info and tgtEq.Info.Name == "Knife" then
+            return CFrame.new(cf.Position) * CFrame.fromOrientation(
+                rngDef:NextNumber(0, 2*math.pi),
+                rngDef:NextNumber(0, 2*math.pi),
+                rngDef:NextNumber(0, 2*math.pi))
+        end
+    end
+    return cf
+end
+
+-- 防禦性視角 (09 §4.2 pitch table)
+function Defense.getDefensiveViewAngles(myShield, targetFS)
+    if myShield == "None" then return nil end
+    local isAbove = getRiotShieldSide(targetFS) ~= "Below"
+    local equipped = myShield == "Equipped"
+    -- 表: Equipped+Above → -90 (低頭, 盾朝下)
+    --     Equipped+Below → +90 (抬頭, 盾朝上)
+    --     Unequipped+Above → +90 (抬頭, 背朝下)
+    --     Unequipped+Below → -90 (低頭, 背朝上)
+    local pitch = (equipped == isAbove) and -90 or 90
+    return { kind = "Normalized", pitch = pitch, yaw = rngDef:NextNumber(0, 360) }
 end
 
 --=========================================================================
@@ -375,8 +587,6 @@ end
 --=========================================================================
 -- §11  TargetSelection (跟主版一樣)
 --=========================================================================
-local FighterController = require(LocalPlayer.PlayerScripts.Controllers.FighterController)
-
 local FighterRegistry = { enemies = {}, byPlayer = {} }
 
 local function isEnemyOf(myF, other)
@@ -714,14 +924,15 @@ local VIEW_ANGLES_SLOT = 20
 
 function LightRagebot.new()
     return setmetatable({
-        _enabled              = false,
-        _spatialLimitGate     = SpatialLimitGate.new(FighterRegistry),
-        _targetSelection      = TargetSelection.new(FighterRegistry, PlayerTagsStub),
-        _hitscanStrategy      = HeadShotPlanner.new(),
-        _meleeStrategy        = HeadPlanner.new(),
-        _characterController  = nil,
-        _fireCount            = 0,
-        _diagnostic           = false,
+        _enabled                 = false,
+        _spatialLimitGate        = SpatialLimitGate.new(FighterRegistry),
+        _targetSelection         = TargetSelection.new(FighterRegistry, PlayerTagsStub),
+        _hitscanStrategy         = HeadShotPlanner.new(),
+        _meleeStrategy           = HeadPlanner.new(),
+        _characterController     = nil,
+        _fireCount               = 0,
+        _diagnostic              = false,
+        _lastDefensiveViewAngles = nil,   -- ★ Defense 記憶最後一次角度
     }, LightRagebot)
 end
 
@@ -747,6 +958,7 @@ end
 function LightRagebot:_Reset()
     self._meleeStrategy:ResetState()
     self._hitscanStrategy:ResetState()
+    self._lastDefensiveViewAngles = nil
     local cc = self._characterController
     if cc then
         cc:SetServerCFrame(nil)
@@ -786,18 +998,36 @@ function LightRagebot:_Plan(dt, action, target, clientCF, evadeMode)
             if ok and r then return self:_EvadePlan(clientCF, evadeMode) end
         end
         local cf, act = self._hitscanStrategy:Plan(dt, target, gun, gated)
-        return { cframe = cf, weaponAction = act, isAttack = true }
+        -- ★ Gun 需要 Defense (isAimPose 為 true 才會算 defensive viewAngles)
+        return { cframe = cf, weaponAction = act, isAttack = true, isAimPose = act ~= nil }
     end
     if ie.type == "Melee" then
         local cf, va, act = self._meleeStrategy:Plan(dt, target, ie.item, gated)
-        return { cframe = cf, viewAngles = va, weaponAction = act, isAttack = true }
+        -- Melee 用自己的 viewAngles (Knife 對齊目標), 跳過 Defense
+        return { cframe = cf, viewAngles = va, weaponAction = act, isAttack = true,
+                 shouldSkipDefense = true }
     end
     return {}
 end
 
-function LightRagebot:_ApplyPlan(plan, cc)
-    cc:SetServerCFrame(plan.cframe)
-    cc:SendViewAngles(VIEW_ANGLES_SLOT, plan.viewAngles)
+function LightRagebot:_ApplyPlan(plan, target, cc)
+    local cframe = plan.cframe
+    local viewAngles = plan.viewAngles
+    -- 無目標 / 無 cframe / melee 跳過 defense
+    if cframe == nil or target == nil or plan.shouldSkipDefense then
+        cc:SetServerCFrame(cframe)
+        cc:SendViewAngles(VIEW_ANGLES_SLOT, viewAngles)
+        return
+    end
+    -- ★ Defense: 根據我方 shield 狀態改 CFrame + viewAngles
+    local myShield = getMyShieldState()
+    local defCFrame = Defense.getDefensiveCFrame(cframe, myShield,
+                        target.fighterState, target.aliveState.rootPart)
+    cc:SetServerCFrame(defCFrame)
+    if plan.isAimPose then
+        self._lastDefensiveViewAngles = Defense.getDefensiveViewAngles(myShield, target.fighterState)
+    end
+    cc:SendViewAngles(VIEW_ANGLES_SLOT, viewAngles or self._lastDefensiveViewAngles)
 end
 
 function LightRagebot:Update(dt)
@@ -816,7 +1046,7 @@ function LightRagebot:Update(dt)
     local target = self._targetSelection:GetTarget()
     local action = ActionPlanner.getAction({ itemBehaviors = myF })
     local plan = self:_Plan(dt, action, target, clientCF, mode)
-    self:_ApplyPlan(plan, cc)
+    self:_ApplyPlan(plan, target, cc)
 
     if plan.weaponAction then
         if not plan._isReloadOrSwap then
