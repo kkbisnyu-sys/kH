@@ -130,6 +130,7 @@ local Config = { data = {
             Priority = { "Primary", "Secondary", "Melee" },
             Enabled  = { Primary = true, Secondary = true, Melee = true },
             OnEmpty  = "SwapOrReload",
+            MeleeOnly = false,   -- ★ v4: 強制只用近戰 (方便 Knife 測試)
         },
         Evasion = {
             Mode = "Random",   -- Light 版只支援 "Random" 和 "Off"
@@ -153,41 +154,40 @@ end
 function ShootLock:Reset() self._lockedUntil = nil end
 
 --=========================================================================
--- §4.5  CFrameCodec + encodeHitPart (K L6673, K L142850) — 封包編碼
--- ★ 關鍵修正: 遊戲原生 item **沒有** ShootAt/Attack/HeavyAttack 方法.
---   那些是 KI wrapper 加上去的. 舊版 callShootAt 看不到方法就靜默 return false,
---   結果每 tick 根本沒送封包! 我們必須自己組 payload 直接 rawFireServer.
+-- §4.5  極端座標常量 + CFrameCodec (K L107476-107510 主版 HeadGlue)
+-- ★ v4 修正: 用主 Ragebot 的 -9e37/-9e7 極端 CFrame 常量, 讓 server
+--   的距離/射線檢查因為 float overflow 而 fail-open. HIT_DATA 常數 (0,1,0)
+--   表示命中 head 的正上方 1 stud.
 --=========================================================================
+local PI = math.pi
+
+-- 從上方打的極端座標 (K L107476-107486)
+local ABOVE_ORIGIN = { ["\0"] = -9e37, ["\1"] = 0,     ["\2"] = 0, ["\3"] = -PI/2, ["\4"] = PI, ["\5"] = PI }
+local ABOVE_DIR    = { ["\0"] = 0,     ["\1"] = -9e7,  ["\2"] = 0, ["\3"] = -PI/2, ["\4"] = PI, ["\5"] = PI }
+-- 從下方打
+local BELOW_ORIGIN = { ["\0"] = -9e37, ["\1"] = 0,     ["\2"] = 0, ["\3"] =  PI/2, ["\4"] = PI, ["\5"] = PI }
+local BELOW_DIR    = { ["\0"] = 0,     ["\1"] =  9e7,  ["\2"] = 0, ["\3"] =  PI/2, ["\4"] = PI, ["\5"] = PI }
+-- 命中資料 (head 物件空間點 (0, 1, 0) — head 表面上方 1 stud)
+local HIT_DATA     = { ["\0"] = 0,     ["\1"] = 1,     ["\2"] = 0, ["\3"] = 0,     ["\4"] = 0,  ["\5"] = 0 }
+
+-- 給 Melee 用: 用 target rootPart 的 yaw/roll 覆蓋 base 的角度 (背刺姿勢)
+local function withRotation(base, rx, ry, rz)
+    return {
+        ["\0"] = base["\0"], ["\1"] = base["\1"], ["\2"] = base["\2"],
+        ["\3"] = rx, ["\4"] = ry, ["\5"] = rz,
+    }
+end
+
+-- CFrameCodec 保留 (只有 viewAngles 用得到, 例如 defense 產生的 defensive CFrame)
 local CFrameCodec = {}
 function CFrameCodec.encode(cf)
     local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
     return {
         ["\0"] = x, ["\1"] = y, ["\2"] = z,
-        ["\3"] = math.atan2(-r12, r22),   -- pitch
-        ["\4"] = math.asin(r02),           -- yaw
-        ["\5"] = math.atan2(-r01, r00),    -- roll
+        ["\3"] = math.atan2(-r12, r22),
+        ["\4"] = math.asin(r02),
+        ["\5"] = math.atan2(-r01, r00),
     }
-end
-
--- K L142850: encodeHitPart(origin, hit) → (raw part, encoded hit CFrame)
-local function encodeHitPart(origin, hit)
-    if hit == nil then return nil, nil end
-    local part = hit.part
-    if not part then return nil, nil end
-    local encoded
-    if hit.objectSpace then
-        encoded = CFrameCodec.encode(CFrame.new(hit.objectSpace))
-    else
-        local ok, closestPos = pcall(function()
-            return part:GetClosestPointOnSurface(origin.Position)
-        end)
-        if ok and closestPos then
-            encoded = CFrameCodec.encode(CFrame.new(closestPos))
-        else
-            encoded = CFrameCodec.encode(CFrame.new(part.Position))
-        end
-    end
-    return part, encoded
 end
 
 --=========================================================================
@@ -724,7 +724,19 @@ end
 --=========================================================================
 local ActionPlanner = {}
 
-local function slotOfItem(item) return item.Info and item.Info.Class end
+-- K L121684: 背包 index 1/2/3 對應 Primary/Secondary/Melee
+local function slotOfItem(item)
+    local idx = item.index or (item.Data and item.Data.ItemIndex)
+    if not idx and item.Info then idx = item.Info.ItemIndex end
+    if     idx == 1 then return "Primary"
+    elseif idx == 2 then return "Secondary"
+    elseif idx == 3 then return "Melee"
+    end
+    -- Fallback: 用 Info.Type 判斷 (Melee/Gun)
+    if item.Info and item.Info.Type == "Melee" then return "Melee" end
+    if item.Info and item.Info.Class then return item.Info.Class end
+    return nil
+end
 
 function ActionPlanner.getAction(ctx)
     local lf = ctx.itemBehaviors
@@ -733,17 +745,27 @@ function ActionPlanner.getAction(ctx)
     local best, bestP       = nil, math.huge
     local emptyBest, emptyP = nil, math.huge
     local anyEnabled = false
-    for _, item in pairs(lf.Items or {}) do
+
+    -- ★ v4: MeleeOnly 模式強制只選 Melee
+    local meleeOnly = W.MeleeOnly
+
+    for idx, item in pairs(lf.Items or {}) do
+        -- 傳 idx 給 slotOfItem 當 fallback (pairs 迭代 numeric table 通常給 index)
         local slot = slotOfItem(item)
-        if slot and W.Enabled[slot] then
+        if not slot and type(idx) == "number" then
+            if idx == 1 then slot = "Primary"
+            elseif idx == 2 then slot = "Secondary"
+            elseif idx == 3 then slot = "Melee" end
+        end
+        if slot and W.Enabled[slot] and (not meleeOnly or slot == "Melee") then
             anyEnabled = true
             local p = table.find(W.Priority, slot) or math.huge
-            if item.Info.Type == "Gun" and (item.Data.Ammo or 0) == 0 then
+            if item.Info and item.Info.Type == "Gun" and (item.Data.Ammo or 0) == 0 then
                 if (item.Data.AmmoReserve or 0) > 0 and p < emptyP then
                     emptyBest, emptyP = { item = item, type = "Gun" }, p
                 end
             elseif best == nil or p < bestP then
-                best, bestP = { item = item, type = item.Info.Type }, p
+                best, bestP = { item = item, type = (item.Info and item.Info.Type) or "Melee" }, p
             end
         end
     end
@@ -771,24 +793,25 @@ function ActionPlanner.getAction(ctx)
 end
 
 --=========================================================================
--- §13  Gun / Melee 封包發送 (自己組, 不靠遊戲 wrapper 方法)
--- ★ 舊版 bug: 遊戲原生 item 沒有 ShootAt/Attack/HeavyAttack 方法.
---   callShootAt() 看到 gun.ShootAt=nil 就靜默 return false, 根本沒送封包!
---   → 就是「為什麼沒射集」的原因.
---   修法: 自己走 encodeHitPart + CFrameCodec + rawFireServer(UseItemRemote, ...)
+-- §13  Gun / Melee 封包發送 (主版 -9e37 極端座標)
+-- ★ v4 修正:
+--   舊版用真實 CFrame + encodeHitPart → server 距離檢查可能 reject.
+--   改用主 Ragebot 的極端座標常量 (-9e37 位置, -9e7 方向), 讓 server 的
+--   float 檢查 overflow → fail-open → 命中判定通過.
+--   Melee 額外用 target rootPart 的 yaw/roll 讓姿勢像背刺.
 --=========================================================================
 
--- Gun 開火: UseItemRemote:StartShooting
-local function gunShoot(item, originCF, dirCF, hitInfo)
+-- Gun 開火 (K L107561): UseItemRemote:StartShooting
+local function gunShoot(item, isAbove, hitboxHead)
     local objectId = item.Data and item.Data.ObjectID
     if not objectId then return false end
-    local hitPart, hitData = encodeHitPart(originCF, hitInfo)
-    if not hitPart or not hitData then return false end
+    local origin = isAbove and ABOVE_ORIGIN or BELOW_ORIGIN
+    local dir    = isAbove and ABOVE_DIR    or BELOW_DIR
     local shotArgs = {
-        ["\0"] = CFrameCodec.encode(originCF),
-        ["\1"] = CFrameCodec.encode(dirCF),
-        ["\2"] = hitPart,
-        ["\3"] = hitData,
+        ["\0"] = origin,
+        ["\1"] = dir,
+        ["\2"] = hitboxHead,
+        ["\3"] = HIT_DATA,
     }
     local isRaycast = item.Info and item.Info.IsRaycast
     local payload = isRaycast
@@ -797,33 +820,42 @@ local function gunShoot(item, originCF, dirCF, hitInfo)
     return pcall(rawFireServer, UseItemRemote, objectId, TOK_START_SHOOTING, payload, nil)
 end
 
--- Melee 普通攻擊: UseItemRemote:StartShooting + AttackAnimation1
-local function meleeAttack(item, originCF, dirCF, hitInfo)
+-- Melee 普通攻擊 (K L40170): UseItemRemote:StartShooting + AttackAnimation1
+-- 用 target rootPart 的旋轉當攻擊角度 (背後刺入的姿勢)
+local function meleeAttack(item, isAbove, targetRoot, hitboxHead)
     local objectId = item.Data and item.Data.ObjectID
     if not objectId then return false end
-    local hitPart, hitData = encodeHitPart(originCF, hitInfo)
-    if not hitPart or not hitData then return false end
+    local pitch, yaw, roll = targetRoot.CFrame:ToOrientation()
+    local atkPitch = isAbove and -PI/2 or PI/2
+    local fromBase = isAbove and ABOVE_ORIGIN or BELOW_ORIGIN
+    local toBase   = isAbove and ABOVE_DIR    or BELOW_DIR
+    local from = withRotation(fromBase, atkPitch, yaw, roll)
+    local to   = withRotation(toBase,   atkPitch, yaw, roll)
     local attackArgs = {
-        ["\0"] = CFrameCodec.encode(originCF),
-        ["\1"] = CFrameCodec.encode(dirCF),
-        ["\2"] = hitPart,
-        ["\3"] = hitData,
+        ["\0"] = from,
+        ["\1"] = to,
+        ["\2"] = hitboxHead,
+        ["\3"] = HIT_DATA,
     }
     local payload = { ["\1"] = attackArgs, ["\2"] = TOK_ATTACK_ANIM_1 }
     return pcall(rawFireServer, UseItemRemote, objectId, TOK_START_SHOOTING, payload, nil)
 end
 
--- Melee 重擊 (Knife 背刺): UseItemRemote:StartAiming + HeavyAttackAnimation1
-local function meleeHeavyAttack(item, originCF, dirCF, hitInfo)
+-- Melee 重擊 (Knife 背刺秒殺, K L40179): UseItemRemote:StartAiming + HeavyAttackAnimation1
+local function meleeHeavyAttack(item, isAbove, targetRoot, hitboxHead)
     local objectId = item.Data and item.Data.ObjectID
     if not objectId then return false end
-    local hitPart, hitData = encodeHitPart(originCF, hitInfo)
-    if not hitPart or not hitData then return false end
+    local pitch, yaw, roll = targetRoot.CFrame:ToOrientation()
+    local atkPitch = isAbove and -PI/2 or PI/2
+    local fromBase = isAbove and ABOVE_ORIGIN or BELOW_ORIGIN
+    local toBase   = isAbove and ABOVE_DIR    or BELOW_DIR
+    local from = withRotation(fromBase, atkPitch, yaw, roll)
+    local to   = withRotation(toBase,   atkPitch, yaw, roll)
     local attackArgs = {
-        ["\0"] = CFrameCodec.encode(originCF),
-        ["\1"] = CFrameCodec.encode(dirCF),
-        ["\2"] = hitPart,
-        ["\3"] = hitData,
+        ["\0"] = from,
+        ["\1"] = to,
+        ["\2"] = hitboxHead,
+        ["\3"] = HIT_DATA,
     }
     local payload = { ["\1"] = attackArgs, ["\2"] = TOK_HEAVY_ATTACK_ANIM_1 }
     return pcall(rawFireServer, UseItemRemote, objectId, TOK_START_AIMING, payload, nil)
@@ -904,10 +936,9 @@ function HeadShotPlanner:Plan(dt, target, gun, gated)
         return standCFrame, nil   -- 站到位, 等 delay
     end
 
+    -- ★ v4: 用極端座標常量, 不再算 aim
     local shoot = function()
-        local origin = standCFrame.Position
-        local aim = CFrame.lookAt(origin, headPosition)
-        gunShoot(gun, aim, aim, { part = hitboxHead })
+        gunShoot(gun, isAbove, hitboxHead)
     end
     return standCFrame, shoot
 end
@@ -961,20 +992,18 @@ function HeadPlanner:Plan(dt, target, weapon, gated)
         return standCFrame, nil, nil
     end
 
-    local origin = standCFrame.Position
-    local aim = CFrame.new(origin, headPosition)
-    local hitInfo = { part = hitboxHead }
+    -- ★ v4: 用極端座標 + target rootPart 旋轉 (背刺姿勢)
 
-    -- ★ Knife 分支: 用 HeavyAttack (背刺秒殺) + 送目標朝向的 viewAngles
+    -- ★ Knife 分支: HeavyAttack (背刺秒殺) + 對齊目標朝向的 viewAngles
     if weapon.Info and weapon.Info.Name == "Knife" then
         return standCFrame, cameraAngles(rootPart), function()
-            meleeHeavyAttack(weapon, aim, aim, hitInfo)
+            meleeHeavyAttack(weapon, isAbove, rootPart, hitboxHead)
         end
     end
 
     -- 其他近戰: 普通 Attack
     return standCFrame, nil, function()
-        meleeAttack(weapon, aim, aim, hitInfo)
+        meleeAttack(weapon, isAbove, rootPart, hitboxHead)
     end
 end
 
@@ -1211,6 +1240,11 @@ if Library then
         Values = { "Swap", "Reload", "SwapOrReload" },
         Default = "SwapOrReload", Multi = false, Text = "On Empty",
         Callback = function(v) Config.data.Ragebot.Weapons.OnEmpty = v end,
+    })
+    gBox:AddToggle("RB_MeleeOnly", {
+        Text = "只用近戰 (Knife 測試)", Default = false,
+        Tooltip = "強制只用 Melee 槽位, 忽略 Primary/Secondary. 開啟後手上會自動切到 Knife/近戰.",
+        Callback = function(v) Config.data.Ragebot.Weapons.MeleeOnly = v end,
     })
 
     sBox:AddDropdown("RB_EvasionMode", {
