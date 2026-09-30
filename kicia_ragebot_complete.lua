@@ -927,7 +927,16 @@ local function lookAtFrom(origin, focus)
     return CFrame.lookAt(origin, origin + dir, Vector3.new(0, -1, 0))
 end
 
-local function randomFarCFrame()
+-- ★ v7 修「有目標時 _EvadePlan 從未被呼叫」問題:
+--   舊版內嵌 randomFarCFrame 只給 (±1e6, 5000-10000, ±1e6) 位置,
+--   不受 Config.Evasion.Mode 控制. 現在改成走 RandomEvasion (2^30 遠)
+--   或 fallback 到 1e6, 讓對戰時每個「沒開火幀」都真正閃避.
+local function evasionFarCFrame(clientCF)
+    if clientCF and Config.data.Ragebot.Evasion.Mode == "Random" then
+        local ok, cf = pcall(RandomEvasion.compute, clientCF)
+        if ok and cf then return cf end
+    end
+    -- Fallback: 舊 1e6 遠處 (Off mode 或 RandomEvasion 失敗時)
     return CFrame.new(
         math.random(-1000000, 1000000),
         math.random(5000, 10000),
@@ -961,13 +970,11 @@ function HeadShotPlanner.new()
     return setmetatable({ _shootLock = ShootLock.new(), _attackStart = nil }, HeadShotPlanner)
 end
 
-function HeadShotPlanner:Plan(dt, target, gun, gated)
+function HeadShotPlanner:Plan(dt, target, gun, gated, clientCF)
     local hitboxHead = target.aliveState.hitboxHead
     local isAbove = getVerticalSideStub() ~= "Below"
     local offset = isAbove and HSP_ABOVE_OFFSET or HSP_BELOW_OFFSET
 
-    -- ★ v5: 預測 head 位置 (補償 ~50ms 網路延遲, 讓 server 收到封包時
-    --   我們的假位置剛好對到 target 的當下位置)
     local leadTime = Config.data.Ragebot.LeadTime or 0.05
     local headPosition = predictHeadPosition(target, leadTime)
 
@@ -978,9 +985,10 @@ function HeadShotPlanner:Plan(dt, target, gun, gated)
         standCFrame = lookAtFrom(headPosition + offset, headPosition)
     end
 
+    -- ★ v7: 沒開火幀走 evasionFarCFrame → 若 Mode=Random 用 2^30, 否則 1e6
     if not self._shootLock:ShouldFire(gated, dt * Config.data.Ragebot.ShootFrames) then
         self._attackStart = nil
-        return randomFarCFrame(), nil
+        return evasionFarCFrame(clientCF), nil
     end
 
     local now2 = os.clock()
@@ -1019,10 +1027,9 @@ function HeadPlanner.new()
     return setmetatable({ _shootLock = ShootLock.new(), _attackStart = nil }, HeadPlanner)
 end
 
-function HeadPlanner:Plan(dt, target, weapon, gated)
+function HeadPlanner:Plan(dt, target, weapon, gated, clientCF)
     local rootPart = target.aliveState.rootPart
     local hitboxHead = target.aliveState.hitboxHead
-    -- ★ v5: 近戰也預測 (Knife 背刺跑動目標)
     local leadTime = Config.data.Ragebot.LeadTime or 0.05
     local headPosition = predictHeadPosition(target, leadTime)
     local isAbove = getVerticalSideStub() ~= "Below"
@@ -1037,7 +1044,7 @@ function HeadPlanner:Plan(dt, target, weapon, gated)
 
     if not self._shootLock:ShouldFire(gated, dt * Config.data.Ragebot.ShootFrames) then
         self._attackStart = nil
-        return randomFarCFrame(), nil, nil
+        return evasionFarCFrame(clientCF), nil, nil
     end
 
     local now2 = os.clock()
@@ -1159,12 +1166,12 @@ function LightRagebot:_Plan(dt, action, target, clientCF, evadeMode)
         if (type(rc) == "number" and now < rc) or (type(sc) == "number" and now < sc) then
             return self:_EvadePlan(clientCF, evadeMode)
         end
-        local cf, act = self._hitscanStrategy:Plan(dt, target, gun, gated)
+        local cf, act = self._hitscanStrategy:Plan(dt, target, gun, gated, clientCF)
         -- ★ Gun 需要 Defense (isAimPose 為 true 才會算 defensive viewAngles)
         return { cframe = cf, weaponAction = act, isAttack = true, isAimPose = act ~= nil }
     end
     if ie.type == "Melee" then
-        local cf, va, act = self._meleeStrategy:Plan(dt, target, ie.item, gated)
+        local cf, va, act = self._meleeStrategy:Plan(dt, target, ie.item, gated, clientCF)
         -- Melee 用自己的 viewAngles (Knife 對齊目標), 跳過 Defense
         return { cframe = cf, viewAngles = va, weaponAction = act, isAttack = true,
                  shouldSkipDefense = true }
