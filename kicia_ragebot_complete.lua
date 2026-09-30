@@ -141,16 +141,23 @@ local Config = { data = {
 }}
 
 --=========================================================================
--- §4  ShootLock (fire rate throttle)
+-- §4  ShootLock (真正的節流)
+-- ★ v6 修 Bug 1: 舊版邏輯 `stillLocked or canFire` 在冷卻中永遠 return true,
+--   每 frame 都射 → 60 packets/sec 洗頻. 改成真節流: 冷卻中拒射.
 --=========================================================================
 local ShootLock = {}
 ShootLock.__index = ShootLock
 function ShootLock.new() return setmetatable({ _lockedUntil = nil }, ShootLock) end
 function ShootLock:ShouldFire(canFire, duration)
     local now = os.clock()
-    local stillLocked = self._lockedUntil ~= nil and now < self._lockedUntil
-    if canFire then self._lockedUntil = now + duration end
-    return stillLocked or canFire
+    if self._lockedUntil ~= nil and now < self._lockedUntil then
+        return false   -- 冷卻中, 拒絕開火
+    end
+    if canFire then
+        self._lockedUntil = now + duration
+        return true
+    end
+    return false
 end
 function ShootLock:Reset() self._lockedUntil = nil end
 
@@ -372,8 +379,12 @@ function ViewAngleDriver:_InstallReplicationHook()
         return
     end
     local driver = self
-    local proxy = {}
-    function proxy.EncodeCameraRotation(_, rot)
+    -- ★ v6 修 Bug 3: proxy 必須 __index 指向原 Utility, 否則遊戲 loop 呼叫其他
+    --   方法 (CompressVector / PackAngle 等) 會 index 到 nil → 本地視角同步崩潰.
+    local proxy = setmetatable({}, { __index = upOrig })
+    -- 同時處理 . 與 : 兩種呼叫 (a1 可能是 self 或 rot, 依原呼叫方式)
+    function proxy.EncodeCameraRotation(a1, a2)
+        local rot = (typeof(a1) == "Vector2") and a1 or a2
         if next(driver._slots) == nil and not driver._fullySuppressed then
             return RotationCodec.encodeCameraRotation(rot)   -- 沒 slot → 正常編碼
         end
@@ -406,7 +417,13 @@ function ViewAngleDriver:Flush()
     if not self._dirty or self._fullySuppressed then return end
     if self._winning == nil then self._dirty = false; return end
     self._dirty = false
-    pcall(rawFireServerUnreliable, UpdateCameraRotationRemote, encodeAngles(self._winning), nil)
+    -- ★ v6 修 Bug 2: UpdateCameraRotation 可能是 RemoteEvent 或 UnreliableRemoteEvent.
+    --   對 RemoteEvent 呼叫 UnreliableRemoteEvent.FireServer 會觸發 C++ 型別驗證失敗.
+    --   動態選對應方法.
+    local fireMethod = UpdateCameraRotationRemote:IsA("UnreliableRemoteEvent")
+        and rawFireServerUnreliable
+        or  rawFireServer
+    pcall(fireMethod, UpdateCameraRotationRemote, encodeAngles(self._winning), nil)
 end
 
 function ViewAngleDriver:ClearAll()
@@ -863,9 +880,21 @@ local function meleeHeavyAttack(item, isAbove, targetRoot, hitboxHead)
 end
 
 -- Reload: UseItemRemote:StartReloading
+-- ★ v6 修 Bug 4: 加雙層節流避免每 frame 送 Reload 封包
+--   1. 檢查 gun 自身 _reload_cooldown (換彈中不重送)
+--   2. 我方自維護 _last_reload_at (每把槍 0.5s 冷卻)
+local _lastReloadAt = setmetatable({}, { __mode = "k" })
 local function itemReload(item)
     local objectId = item.Data and item.Data.ObjectID
     if not objectId then return false end
+    local now = tick()
+    -- 檢查遊戲自己的 reload cooldown
+    local rc = item._reload_cooldown
+    if type(rc) == "number" and now < rc then return false end
+    -- 我方節流: 同一把槍 0.5s 只送一次
+    local last = _lastReloadAt[item]
+    if last and (now - last) < 0.5 then return false end
+    _lastReloadAt[item] = now
     return pcall(rawFireServer, UseItemRemote, objectId, TOK_START_RELOADING,
                  { ["\1"] = TOK_RELOAD, ["\2"] = TOK_RELOAD }, nil)
 end
@@ -1108,6 +1137,12 @@ function LightRagebot:_Plan(dt, action, target, clientCF, evadeMode)
     if action.type == "Reload" then
         local item = action.itemEnum.item
         local plan = self:_EvadePlan(clientCF, evadeMode)
+        -- ★ v6 修 Bug 4: 換彈中就別再送 Reload 封包 (itemReload 內部也節流)
+        local rc = item._reload_cooldown
+        if type(rc) == "number" and tick() < rc then
+            plan._isReloadOrSwap = true   -- 純閃避, 不送封包
+            return plan
+        end
         plan.weaponAction = function() itemReload(item) end
         plan._isReloadOrSwap = true
         return plan
