@@ -192,6 +192,86 @@ function CFrameCodec.encode(cf)
 end
 
 --=========================================================================
+-- §4.6  PartGlue (K L83836-83877) — 開火時「黏頭」核心
+-- ★ v8 修沒射中: 單純 -9e37 封包不夠, 需要 PartGlue 讓 server 把
+--   PhysicsRepRootPart 當目標頭 → 相對座標還原. 否則距離/raycast 檢查失敗.
+--   每 tick Acquire(ourRoot, 頭):
+--     1. setthreadidentity(8) + sethiddenproperty("PhysicsRepRootPart", 頭)
+--     2. 第一次拆目標頭 WeldConstraint.Part1 + Anchored
+--     3. 本地搬頭到 farCF (旋轉歸零)
+--     4. 回傳 farCF, Planner 站 farCF + offset
+--   Server 看你: 伺服器上的頭.CFrame * CFrame.new(offset)
+--=========================================================================
+
+-- farCF 載入時隨機抽一次 (K L83840)
+local PG_FAR_CF = CFrame.new(
+    math.random(-100000, -10000),
+    100000,
+    math.random(-100000, 10000)
+)
+
+local PartGlue = {}
+PartGlue.__index = PartGlue
+
+function PartGlue.new()
+    return setmetatable({
+        _bindings   = {},     -- ourPart → targetPart
+        _gluedParts = {},     -- targetPart → {refCount, weld, originalPart1}
+    }, PartGlue)
+end
+
+local function setPhysicsRoot(part, root)
+    local id = getTID and getTID() or nil
+    if setTID then pcall(setTID, 8) end
+    pcall(rawSetHP, part, "PhysicsRepRootPart", root)
+    if setTID and id then pcall(setTID, id) end
+end
+
+function PartGlue:_SetupGlue(targetPart)
+    local e = self._gluedParts[targetPart]
+    if e then e.refCount = e.refCount + 1; return end
+    local weld = targetPart:FindFirstChildOfClass("WeldConstraint")
+    local origPart1 = weld and weld.Part1 or nil
+    if weld then pcall(rawSetHP, weld, "Part1", nil) end
+    pcall(rawSetHP, targetPart, "Anchored", true)
+    self._gluedParts[targetPart] = { refCount = 1, weld = weld, originalPart1 = origPart1 }
+end
+
+function PartGlue:_ReleaseGlue(targetPart)
+    local e = self._gluedParts[targetPart]
+    if not e then return end
+    e.refCount = e.refCount - 1
+    if e.refCount > 0 then return end
+    if e.weld and e.originalPart1 then
+        pcall(rawSetHP, e.weld, "Part1", e.originalPart1)
+    end
+    self._gluedParts[targetPart] = nil
+end
+
+function PartGlue:Acquire(ourPart, targetPart)
+    setPhysicsRoot(ourPart, targetPart)
+    local prev = self._bindings[ourPart]
+    if prev ~= targetPart then
+        if prev then self:_ReleaseGlue(prev) end
+        self:_SetupGlue(targetPart)
+        self._bindings[ourPart] = targetPart
+    end
+    rawSetCFrame(targetPart, CFrame.new(PG_FAR_CF.Position))
+    return PG_FAR_CF
+end
+
+function PartGlue:Free(ourPart)
+    local tgt = self._bindings[ourPart]
+    if not tgt then return end
+    self._bindings[ourPart] = nil
+    self:_ReleaseGlue(tgt)
+end
+
+function PartGlue:Destroy()
+    for our in pairs(self._bindings) do self:Free(our) end
+end
+
+--=========================================================================
 -- §5  CFrameDesync (K L144260 + R L37592) — 位置 desync 核心
 --=========================================================================
 local CFrameDesync = {}
@@ -887,8 +967,9 @@ end
 local HeadShotPlanner = {}
 HeadShotPlanner.__index = HeadShotPlanner
 
-local HSP_ABOVE_OFFSET = Vector3.new(0, 0.5, 0)
-local HSP_BELOW_OFFSET = Vector3.new(0, -3, 0)
+-- ★ v8: offsets 改成主版 HeadGlue 常數 (K L107476-107477, 搭配 PartGlue)
+local HSP_ABOVE_OFFSET = Vector3.new(0, -0.7,  0.05)
+local HSP_BELOW_OFFSET = Vector3.new(0, -3.85, 0.05)
 local HSP_ATTACK_DELAY = 0.06666666666666667
 
 local function lookAtFrom(origin, focus)
@@ -928,25 +1009,31 @@ local function predictHeadPosition(target, leadTime)
     return head.Position + vel * leadTime
 end
 
-function HeadShotPlanner.new()
-    return setmetatable({ _shootLock = ShootLock.new(), _attackStart = nil }, HeadShotPlanner)
+function HeadShotPlanner.new(partGlue)
+    return setmetatable({
+        _shootLock    = ShootLock.new(),
+        _attackStart  = nil,
+        _partGlue     = partGlue,
+        _gluedOurPart = nil,
+    }, HeadShotPlanner)
 end
 
-function HeadShotPlanner:Plan(dt, target, gun, gated)
+function HeadShotPlanner:Plan(dt, target, gun, ourRoot, gated)
     local hitboxHead = target.aliveState.hitboxHead
     local isAbove = getVerticalSideStub() ~= "Below"
     local offset = isAbove and HSP_ABOVE_OFFSET or HSP_BELOW_OFFSET
 
-    -- ★ v5: 預測 head 位置 (補償 ~50ms 網路延遲, 讓 server 收到封包時
-    --   我們的假位置剛好對到 target 的當下位置)
-    local leadTime = Config.data.Ragebot.LeadTime or 0.05
-    local headPosition = predictHeadPosition(target, leadTime)
+    -- ★ v8: PartGlue:Acquire 每 tick (在 ShootLock 判定之前)
+    -- 回傳 farCF (遠處固定點), 本地 target head 也被搬到那裡,
+    -- PhysicsRepRootPart 被設成 target head → server 相對座標還原
+    local glued = self._partGlue:Acquire(ourRoot, hitboxHead)
+    self._gluedOurPart = ourRoot
 
     local standCFrame
     if isAbove then
-        standCFrame = CFrame.new(headPosition + offset)
+        standCFrame = glued + offset
     else
-        standCFrame = lookAtFrom(headPosition + offset, headPosition)
+        standCFrame = lookAtFrom(glued.Position + offset, hitboxHead.Position)
     end
 
     if not self._shootLock:ShouldFire(gated, dt * Config.data.Ragebot.ShootFrames) then
@@ -970,6 +1057,11 @@ end
 function HeadShotPlanner:ResetState()
     self._attackStart = nil
     self._shootLock:Reset()
+    -- ★ v8: 修 KI 原版 bug (檔 07 §3.5), HeadGlue 原本沒 Free, 綁定永遠不釋放
+    if self._gluedOurPart then
+        self._partGlue:Free(self._gluedOurPart)
+        self._gluedOurPart = nil
+    end
 end
 
 --=========================================================================
@@ -978,32 +1070,39 @@ end
 local HeadPlanner = {}
 HeadPlanner.__index = HeadPlanner
 
-local HP_ABOVE_OFFSET = Vector3.new(0, 0, 0)      -- 直接站頭上
-local HP_BELOW_OFFSET = Vector3.new(0, -3, 0)
+-- ★ v8: offsets 改成主版 Backstab 常數 (K L40030-40031, 跟 HeadGlue 一樣)
+local HP_ABOVE_OFFSET = Vector3.new(0, -0.7,  0.05)
+local HP_BELOW_OFFSET = Vector3.new(0, -3.85, 0.05)
 
 local function cameraAngles(part)
     local pitch, yaw = part.CFrame:ToOrientation()
     return { kind = "Normalized", pitch = math.deg(pitch), yaw = math.deg(yaw) }
 end
 
-function HeadPlanner.new()
-    return setmetatable({ _shootLock = ShootLock.new(), _attackStart = nil }, HeadPlanner)
+function HeadPlanner.new(partGlue)
+    return setmetatable({
+        _shootLock    = ShootLock.new(),
+        _attackStart  = nil,
+        _partGlue     = partGlue,
+        _gluedOurPart = nil,
+    }, HeadPlanner)
 end
 
-function HeadPlanner:Plan(dt, target, weapon, gated)
+function HeadPlanner:Plan(dt, target, weapon, ourRoot, gated)
     local rootPart = target.aliveState.rootPart
     local hitboxHead = target.aliveState.hitboxHead
-    -- ★ v5: 近戰也預測 (Knife 背刺跑動目標)
-    local leadTime = Config.data.Ragebot.LeadTime or 0.05
-    local headPosition = predictHeadPosition(target, leadTime)
     local isAbove = getVerticalSideStub() ~= "Below"
     local offset = isAbove and HP_ABOVE_OFFSET or HP_BELOW_OFFSET
 
+    -- ★ v8: PartGlue:Acquire (跟 HeadShotPlanner 共用 partGlue)
+    local glued = self._partGlue:Acquire(ourRoot, hitboxHead)
+    self._gluedOurPart = ourRoot
+
     local standCFrame
     if isAbove then
-        standCFrame = CFrame.new(headPosition + offset)
+        standCFrame = glued + offset
     else
-        standCFrame = lookAtFrom(headPosition + offset, headPosition)
+        standCFrame = lookAtFrom(glued.Position + offset, hitboxHead.Position)
     end
 
     if not self._shootLock:ShouldFire(gated, dt * Config.data.Ragebot.ShootFrames) then
@@ -1036,6 +1135,10 @@ end
 function HeadPlanner:ResetState()
     self._attackStart = nil
     self._shootLock:Reset()
+    if self._gluedOurPart then
+        self._partGlue:Free(self._gluedOurPart)
+        self._gluedOurPart = nil
+    end
 end
 
 --=========================================================================
@@ -1047,16 +1150,19 @@ LightRagebot.__index = LightRagebot
 local VIEW_ANGLES_SLOT = 20
 
 function LightRagebot.new()
+    -- ★ v8: 槍和近戰共用同一個 PartGlue (K L109884)
+    local partGlue = PartGlue.new()
     return setmetatable({
         _enabled                 = false,
+        _partGlue                = partGlue,
         _spatialLimitGate        = SpatialLimitGate.new(FighterRegistry),
         _targetSelection         = TargetSelection.new(FighterRegistry, PlayerTagsStub),
-        _hitscanStrategy         = HeadShotPlanner.new(),
-        _meleeStrategy           = HeadPlanner.new(),
+        _hitscanStrategy         = HeadShotPlanner.new(partGlue),
+        _meleeStrategy           = HeadPlanner.new(partGlue),
         _characterController     = nil,
         _fireCount               = 0,
         _diagnostic              = false,
-        _lastDefensiveViewAngles = nil,   -- ★ Defense 記憶最後一次角度
+        _lastDefensiveViewAngles = nil,
     }, LightRagebot)
 end
 
@@ -1095,7 +1201,7 @@ function LightRagebot:_EvadePlan(clientCF, mode)
     return { cframe = RandomEvasion.compute(clientCF) }
 end
 
-function LightRagebot:_Plan(dt, action, target, clientCF, evadeMode)
+function LightRagebot:_Plan(dt, action, target, ourRoot, clientCF, evadeMode)
     local gated = target ~= nil and not self._spatialLimitGate:Tick(target)
     if action == nil then return self:_EvadePlan(clientCF, evadeMode) end
     if action.type == "Swap" then
@@ -1124,12 +1230,12 @@ function LightRagebot:_Plan(dt, action, target, clientCF, evadeMode)
         if (type(rc) == "number" and now < rc) or (type(sc) == "number" and now < sc) then
             return self:_EvadePlan(clientCF, evadeMode)
         end
-        local cf, act = self._hitscanStrategy:Plan(dt, target, gun, gated)
+        local cf, act = self._hitscanStrategy:Plan(dt, target, gun, ourRoot, gated)
         -- ★ Gun 需要 Defense (isAimPose 為 true 才會算 defensive viewAngles)
         return { cframe = cf, weaponAction = act, isAttack = true, isAimPose = act ~= nil }
     end
     if ie.type == "Melee" then
-        local cf, va, act = self._meleeStrategy:Plan(dt, target, ie.item, gated)
+        local cf, va, act = self._meleeStrategy:Plan(dt, target, ie.item, ourRoot, gated)
         -- Melee 用自己的 viewAngles (Knife 對齊目標), 跳過 Defense
         return { cframe = cf, viewAngles = va, weaponAction = act, isAttack = true,
                  shouldSkipDefense = true }
@@ -1172,7 +1278,8 @@ function LightRagebot:Update(dt)
 
     local target = self._targetSelection:GetTarget()
     local action = ActionPlanner.getAction({ itemBehaviors = myF })
-    local plan = self:_Plan(dt, action, target, clientCF, mode)
+    local ourRoot = cc._rootPart   -- ★ v8: PartGlue 需要我方 root
+    local plan = self:_Plan(dt, action, target, ourRoot, clientCF, mode)
     self:_ApplyPlan(plan, target, cc)
 
     if plan.weaponAction then
@@ -1193,6 +1300,7 @@ end
 
 function LightRagebot:Destroy()
     self:_Reset()
+    if self._partGlue then self._partGlue:Destroy() end   -- ★ v8
     if self._characterController then self._characterController:Destroy() end
 end
 
