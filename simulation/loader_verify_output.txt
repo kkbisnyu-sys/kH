@@ -1,0 +1,88 @@
+╔═══════════════════════════════════════════════════════════╗
+║  lwk19_owo_loader 封包/動作完整性檢查                     ║
+╚═══════════════════════════════════════════════════════════╝
+
+
+═══════════════════════════════════════════════════════════
+  場景: A. 有 md3_hub_template.luau (完整)
+═══════════════════════════════════════════════════════════
+  [GUARD] 檢查 getgenv().lwk19_owo_loaded → false (首次執行)
+  [WAIT] game:IsLoaded() → true (假設遊戲已載入)
+  [WAIT] Players.LocalPlayer 取得成功
+  [EXEC_API] queueOnTeleport = queue_on_teleport (執行器函式)
+  [EVENT] LocalPlayer.OnTeleport:Connect(handler) — 註冊跨服重連
+  [BOOT] → executeHub()
+  [BOOT]   設定 getgenv().lwk19_owo_loaded = true
+  [FS] isfile('lwk19_owo/md3_hub_template.luau') → true
+  [FS] readfile('lwk19_owo/md3_hub_template.luau') → 51 bytes
+  [HUB] ★ 執行 hub 內容 — 這裡才是 RAGEBOT 真正被載入的地方
+  [HUB]   hub 會建立 Fighters/PlayerContext/Ragebot 物件
+  [HUB]   安裝 hookCameraReplication / hookCameraSway 等等
+  [HUB]   註冊 RunService.Heartbeat → Ragebot:Update(dt)
+
+═══════════════════════════════════════════════════════════
+  場景: B. 無 md3_hub_template.luau (不完整)
+═══════════════════════════════════════════════════════════
+  [GUARD] 檢查 getgenv().lwk19_owo_loaded → false (首次執行)
+  [WAIT] game:IsLoaded() → true (假設遊戲已載入)
+  [WAIT] Players.LocalPlayer 取得成功
+  [EXEC_API] queueOnTeleport = queue_on_teleport (執行器函式)
+  [EVENT] LocalPlayer.OnTeleport:Connect(handler) — 註冊跨服重連
+  [BOOT] → executeHub()
+  [BOOT]   設定 getgenv().lwk19_owo_loaded = true
+  [FS] isfile('lwk19_owo/md3_hub_template.luau') → false
+  [FS] isfile('md3_hub_template.luau') → false
+  [FS] isfile('lwk19_owo.luau') → false
+  [WARN] [lwk19_owo] 請確認 'md3_hub_template.luau' 已放置於注入器的 workspace/lwk19_owo/ 目錄中。
+
+═══════════════════════════════════════════════════════════
+  封包完整性分析
+═══════════════════════════════════════════════════════════
+
+★ 分析: loader 自己會發出哪些封包?
+  ── 檢查 loader 原始碼中的 FireServer/InvokeServer 調用...
+     grep 結果: 0 個 FireServer, 0 個 InvokeServer
+  ── loader 只調用 executor API (isfile/readfile/loadstring/queue_on_teleport)
+  ── loader 只註冊 OnTeleport (客戶端事件, 非網路封包)
+
+★ 結論: loader 本身完全不發送任何遊戲封包!
+
+─────────────────────────────────────────────────────────
+
+★ 對比: 完整 RAGEBOT 執行鏈需要的封包 (見 RAGEBOT_ANALYSIS.md)
+
+  必需 1: UseItemRemote:FireServer("StartShooting", ...)   [射擊]
+  必需 2: 物理引擎複製 rootPart.CFrame → server              [假位置]
+  必需 3: UpdateCameraRotationRemote:FireServer(...)         [視角欺騙]
+  必需 4: UseItemRemote:FireServer("StartReloading", ...)  [換彈]
+
+  ★ 這些封包必須由 hub (md3_hub_template.luau) 內部才會發出
+  ★ loader 只是把 hub 讀進來並執行, 自己不碰網路
+
+─────────────────────────────────────────────────────────
+
+═══════════════════════════════════════════════════════════
+  場景結果對照
+═══════════════════════════════════════════════════════════
+  場景 A (有 hub 檔): loaded=true, warnings=0
+  場景 B (無 hub 檔): loaded=false, warnings=1
+
+[驗證判定]
+  loader 完整性: ✓ 語法正確, 邏輯完整
+  獨立可用性  : ✗ 不完整 - 必須依賴 workspace 內的 hub 檔案
+  執行链完整性: ✗ 不完整 - loader 執行後只加了 1 個 OnTeleport 監聽
+                        + 讀不到 hub 檔就只印警告然後結束
+
+  缺少組件:
+    ✗ md3_hub_template.luau  (RAGEBOT 主體, 需自備)
+    ✗ 雲端 URL (cloudUrl 目前是註解狀態, 未啟用)
+    ✗ Fighters/PlayerContext/Ragebot 建構器 (在 hub 內)
+
+[結論]
+  這個 loader 只是一個 stub / bootloader。它負責:
+    1. 從本地 workspace 找 hub 檔
+    2. 註冊 queue_on_teleport 讓跨服自動重載
+    3. 設 getgenv 標記防止重複載入
+
+  但它本身不含任何 RAGEBOT 邏輯,
+  也不會發出任何遊戲封包 (射擊/假位置/視角) 除非 hub 檔存在。
